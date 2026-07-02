@@ -1,0 +1,5 @@
+# Optional native microphone support on Raspberry Pi.
+sounddevice==0.4.7
+
+# Optional if replacing EnergyVAD with WebRTC VAD.
+webrtcvad==2.0.10

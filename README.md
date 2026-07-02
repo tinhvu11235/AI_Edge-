@@ -1,708 +1,705 @@
-# Edge Voice-to-Voice Push-to-Talk Runtime
+# AI Edge Assistant Offline trên Raspberry Pi 5
 
-Repository này là prototype AI Edge cho luồng Voice-to-Voice offline trên
-Raspberry Pi 5 / Linux ARM64. Mục tiêu kỹ thuật là kiểm chứng pipeline:
+README này là bài nộp tóm tắt cho bài kiểm tra năng lực AI Edge số 2. Nội dung được
+viết dựa trên repository hiện tại: source đang là prototype/simulated pipeline, có mock
+backend để kiểm tra thiết kế đa luồng, ring buffer, queue/backpressure,
+text-normalization cho TTS code-switching và benchmark CPU local. Repository chưa wire
+model thật Silero/WebRTC VAD, SenseVoiceSmall, Valtec-TTS hoặc VieNeu-TTS.
 
-```text
-button down -> record PCM in RAM -> button up -> ASR -> TTS -> audio bytes
-```
+## 1. Giới Thiệu Dự Án
 
-KPI chính: Real Time Factor (RTF) toàn luồng ASR + TTS nhỏ hơn `0.3`, tức
-audio 5 giây cần xử lý dưới 1.5 giây. Benchmark cũng theo dõi RSS RAM qua nhiều
-vòng để phát hiện memory leak.
+Mục tiêu hệ thống là xây dựng trợ lý ảo offline cho bảng điều khiển xe điện thông minh
+trên Raspberry Pi 5. Microphone luôn mở ở chế độ Always-on để nhận lệnh rảnh tay, nhưng
+ASR/TTS không được chạy liên tục. VAD đóng vai trò gate: chỉ khi phát hiện tiếng người
+hợp lệ, audio mới được đóng gói thành segment và đưa sang thread inference.
 
-## Bài trả lời theo đề bài kiểm tra
-
-Phần này là phần giải trình trực tiếp theo từng yêu cầu của bài kiểm tra. Các
-mục phía sau mô tả chi tiết code, cách chạy và benchmark trong repo.
-
-### Phần 1: Thiết kế tổng quan
-
-Pipeline Voice-to-Voice dạng Push-to-Talk:
+Pipeline tổng quát:
 
 ```text
-Người dùng bấm nút
-  -> bắt đầu ghi âm PCM 16 kHz mono vào RAM
-Người dùng nhả nút
-  -> ghép các PCM frame trong RAM
-  -> ASR chuyển audio thành text
-  -> TTS chuyển text thành audio bytes
-  -> phát audio ra loa
-  -> clear buffer, log RTF/RAM
+Microphone always-on / simulated audio
+  -> Audio frame 20 ms, PCM16 mono, 16 kHz
+  -> VAD nhẹ
+  -> Ring Buffer cố định 3 giây
+  -> Thread-safe Queue có maxsize
+  -> ASR adapter
+  -> Text-normalization / prosody
+  -> TTS adapter
+  -> Audio output / dashboard alert
 ```
 
-Trong repo, phần lõi pipeline nằm ở `src/edge_voice_test/pipeline.py`. API hiện
-có:
+Thiết bị và backend mục tiêu theo đề bài:
 
-- `VoicePipeline.__init__()`: tạo ASR/TTS backend một lần.
-- `warm_up()`: chạy dummy ASR/TTS để giảm cold-start latency.
-- `start_recording()`: bắt đầu lượt PTT, clear buffer cũ.
-- `append_audio_chunk()`: nhận raw PCM frame. Hàm này tương đương
-  `on_audio_frame()` trong yêu cầu bài.
-- `stop_and_process()`: dừng ghi, chạy ASR -> TTS, đo RTF/RAM, clear buffer.
+- Device: Raspberry Pi 5, Broadcom BCM2712, 4 nhân Cortex-A76, RAM 4GB/8GB,
+  Linux ARM64.
+- VAD mục tiêu: Silero VAD hoặc WebRTC VAD.
+- ASR mục tiêu: SenseVoiceSmall.
+- TTS mục tiêu: Valtec-TTS zero-shot cloning khoảng 74.8M parameters hoặc
+  VieNeu-TTS v2-Turbo.
+- KPI background: Audio + VAD không vượt 40% tổng CPU.
+- KPI active: ASR + TTS không vượt 70% tổng CPU.
+- KPI RAM: không tăng dần theo thời gian.
 
-Chọn `whisper.cpp` cho Whisper Tiny trên Raspberry Pi 5 vì:
+Trạng thái repo hiện tại:
 
-- Là backend C/C++ native, nhẹ, phù hợp CPU ARM64 không GPU.
-- Hỗ trợ model Whisper Tiny đã lượng tử hóa Q8/Q5/Q4.
-- Có thể build Release native để tận dụng ARM NEON SIMD trên Cortex-A76.
-- Python chỉ điều phối pipeline, không chạy inference bằng Python thuần tuần tự.
-- Dễ đóng gói trong Docker ARM64 và chạy offline 100%.
+- Đã có simulated audio, EnergyVAD fallback, MockASR, MockTTS.
+- Đã có producer-consumer threading, fixed-size ring buffer, queue maxsize,
+  VAD timeout, cooldown, drop-oldest/drop-newest policy.
+- Đã có benchmark CPU simulated local và Docker ARM64 target.
+- Chưa có adapter model thật và chưa có benchmark trên Raspberry Pi 5 thật.
+- Chưa có module phát audio ra loa; `MockTTS` trả về bytes/metadata để chứng minh
+  hợp đồng TTS.
 
-Không chọn `sherpa-onnx` làm hướng chính trong repo này vì mục tiêu bài đang tập
-trung vào Whisper Tiny GGML/GGUF và quantization của `whisper.cpp`. Tuy nhiên
-`sherpa-onnx` vẫn là phương án hợp lệ nếu muốn dùng ONNX Runtime session
-persistent.
+## 2. Bài Trả Lời Theo Đề Bài Kiểm Tra
 
-Chọn Piper TTS cho tiếng Việt vì:
+### Phần 1: Thiết Kế Tổng Quan Hệ Thống Always-on
 
-- Chạy offline 100%.
-- Model ONNX nhỏ, phù hợp CPU ARM.
-- Có tiếng Việt và dễ triển khai trên Linux ARM64.
-- Dễ tích hợp với pipeline Python qua CLI hoặc session/binding nếu có.
+Pipeline đề xuất:
 
-Nguyên tắc load model:
-
-- ASR model và TTS model phải được khởi tạo trong `VoicePipeline.__init__()`.
-- Khi người dùng bấm hoặc nhả nút, chương trình chỉ xử lý audio mới.
-- Không load lại model trong mỗi lượt Push-to-Talk.
-- Trong repo hiện tại, simulated backend chứng minh load-once bằng
-  `asr_load_count == 1` và `tts_load_count == 1`.
-- Lưu ý kỹ thuật: adapter real `whisper.cpp`/Piper hiện gọi CLI qua subprocess,
-  nên CLI có thể tự load model lại mỗi lượt. Đây là giới hạn đã ghi rõ; bản tối
-  ưu cuối nên dùng binding/session persistent.
-
-### Phần 2: Lượng tử hóa model
-
-Mức lượng tử hóa được chọn: **Q5** cho Whisper Tiny.
-
-Lý do chọn Q5:
-
-- Cân bằng tốt giữa tốc độ, RAM và độ chính xác.
-- Nhẹ hơn FP16/Q8 nên giảm memory bandwidth, giúp CPU ARM xử lý nhanh hơn.
-- Chính xác hơn Q4, giảm nguy cơ WER tăng quá mức với tiếng Việt.
-- Kết quả mô phỏng hiện có: `mean_rtf = 0.19459`,
-  `wer_delta_estimate = 0.012`, dưới ngưỡng suy giảm WER 2%.
-
-Vì sao Q5 giúp tối ưu tốc độ trên CPU ARM:
-
-- Model nhỏ hơn làm giảm lượng dữ liệu phải đọc từ RAM/cache.
-- CPU Cortex-A76 thường bị giới hạn bởi memory bandwidth khi inference model nhỏ
-  chạy nhiều lớp liên tiếp.
-- Quantized weights giúp backend native dùng kernel tối ưu tốt hơn so với FP16
-  trong môi trường không GPU.
-
-Vì sao không chọn mức khác:
-
-- `FP16`: chính xác nhất nhưng chậm hơn, tốn RAM/bandwidth hơn, khó đạt RTF
-  `< 0.3` trên CPU nếu pipeline còn có TTS.
-- `INT8`: là lựa chọn hợp lý nếu dùng backend INT8 chuẩn như ONNX Runtime, nhưng
-  repo này đang theo flow `whisper.cpp` GGML/GGUF nên dùng Q-format trực tiếp.
-- `Q8`: độ chính xác tốt, nhưng tốc độ/RAM chưa tối ưu bằng Q5.
-- `Q4`: nhanh và nhẹ hơn Q5, nhưng WER delta ước tính `0.026`, vượt ngưỡng 2%.
-
-Điều kiện chất lượng: WER sau lượng tử hóa không được suy giảm quá 2% so với
-bản gốc. Vì vậy Q5 được chọn thay vì Q4.
-
-### Phần 3: Backend và tối ưu hiệu năng
-
-Build `whisper.cpp` trên Raspberry Pi 5 để tận dụng ARM NEON SIMD:
-
-```bash
-git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git
-cmake -S whisper.cpp -B whisper.cpp/build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_NATIVE=ON
-cmake --build whisper.cpp/build -j4 --config Release
+```text
+Microphone luôn mở
+  -> Audio frame
+  -> VAD
+  -> Ring Buffer
+  -> Thread-safe Queue
+  -> ASR
+  -> TTS
+  -> Audio output
 ```
 
-Cấu hình nguyên tắc:
+Cần tách riêng luồng thu âm và luồng inference vì audio capture là tác vụ realtime.
+Microphone phải được đọc đều theo frame 10/20/30 ms; nếu đưa ASR/TTS vào cùng luồng này,
+một lần inference chậm có thể làm mất frame audio hoặc treo toàn pipeline. Trong repo,
+`AlwaysOnPipeline.run()` tạo hai thread:
 
-- Dùng Linux ARM64 native, không chạy x86 emulation khi benchmark thật.
-- Build `Release`, bật native CPU optimization.
-- Không dùng Python thuần tuần tự cho inference.
-- Python chỉ làm orchestration: nhận PCM, gọi backend native, đo metric, quản lý
-  buffer.
+- Producer: `producer_audio_vad_thread()` đọc audio, ghi ring buffer, chạy VAD, emit
+  `AudioSegment`.
+- Consumer: `consumer_asr_thread()` lấy segment từ queue, chạy ASR/TTS mock.
 
-Thiết lập `num_threads`:
+VAD giúp giảm CPU bằng cách chặn ASR/TTS trong lúc chờ. Ở Background Listening,
+`SimulatedAudioSource` không tạo speech, VAD chỉ tính RMS frame và pipeline không enqueue
+segment nào. Do đó ASR/TTS không chạy liên tục.
 
-- Raspberry Pi 5 có 4 nhân Cortex-A76 vật lý.
-- Không mặc định chọn `num_threads = 4` cho mọi trường hợp.
-- Điểm khởi đầu hợp lý là `num_threads = 2`, sau đó benchmark 1, 2, 3, 4.
+Cách kiểm soát CPU trong thiết kế:
 
-Vì sao `num_threads = 4` đôi khi chậm hơn `num_threads = 2`:
+- Background: chỉ chạy audio source + VAD nhẹ, frame 20 ms, queue rỗng.
+- Active: ASR/TTS chỉ chạy theo segment đã cắt, không stream liên tục.
+- Giới hạn utterance bằng `max_utterance_ms` để inference không bị kéo dài vô hạn.
+- Queue có maxsize để không tích lũy backlog.
+- Benchmark đo CPU theo phần trăm tổng CPU:
+  `process_cpu_delta / wall_time / cpu_count * 100`.
+- Khi lên Pi thật, cần giới hạn thread của backend native/BLAS và chọn model/quantization
+  phù hợp nếu CPU vượt 40%/70%.
 
-- Tranh chấp cache giữa các worker thread.
-- Overhead tạo/lập lịch/sync thread.
-- Nghẽn memory bandwidth khi nhiều thread cùng đọc model weights.
-- Hệ thống vẫn cần CPU cho audio I/O, OS, Python orchestration.
-- Raspberry Pi 5 có thể thermal throttling khi chạy full 4 core lâu.
+### Phần 2: Thiết Kế VAD Và Ring Buffer
 
-Cách benchmark thực tế:
+Audio được thu liên tục theo frame nhỏ. Cấu hình simulated hiện tại:
 
-```bash
-for t in 1 2 3 4; do
-  python benchmarks/benchmark_pipeline.py \
-    --asr-backend whisper-cpp \
-    --tts-backend piper \
-    --quant Q5 \
-    --threads "$t" \
-    --wav sample_5s.wav \
-    --loops 30 \
-    --out "results/pi5_q5_t${t}.csv"
-done
+```text
+sample_rate = 16000 Hz
+frame_ms = 20 ms
+format = PCM16 mono
+frame_bytes = 16000 * 20 / 1000 * 2 = 640 bytes
+ring_buffer_seconds = 3.0
+ring_buffer_bytes = 16000 * 3 * 2 = 96000 bytes
 ```
 
-Chọn cấu hình có:
+Ring buffer nằm trong `edge_assistant/ring_buffer.py` và dùng `bytearray` có capacity cố
+định. Nó không dùng list/array tăng vô hạn. Khi buffer đầy, byte cũ bị ghi đè. Hàm
+`snapshot()` trả về audio theo thứ tự thời gian để thêm pre-roll vào utterance khi VAD
+bắt đầu trigger.
 
-- `mean_rtf < 0.3`.
-- `p95_rtf < 0.3` nếu muốn chắc hơn cho realtime.
-- `ram_slope_mb_per_loop` gần 0.
-- Transcript vẫn đạt WER trong ngưỡng cho phép.
+Trạng thái VAD trong `producer_audio_vad_thread()`:
 
-### Phần 4: Pseudo-code Python kiến trúc chuẩn
+- `speech_start_ms`: số ms speech liên tiếp để bắt đầu utterance.
+- `speech_end_ms`: số ms silence để đóng utterance.
+- `max_utterance_ms`: timeout để cắt utterance quá dài.
+- `cooldown_ms`: nghỉ ngắn sau mỗi trigger để giảm noise trigger liên tục.
 
-Pseudo-code dưới đây mô tả kiến trúc đầy đủ mong muốn trên Raspberry Pi 5. Code
-trong repo hiện đã có phần lõi tương ứng, nhưng chưa có GPIO/mic/speaker service
-thật.
+Khi VAD phát hiện speech, producer tạo utterance buffer có capacity cố định:
+
+```text
+max_segment_bytes = ring_buffer_bytes + max_utterance_ms * sample_rate * 2 / 1000
+```
+
+Sau khi emit segment, utterance buffer được `clear()`, counters được reset, và producer
+tiếp tục đọc audio.
+
+### Phần 3: Kiến Trúc Đa Luồng Producer-Consumer
+
+Thread 1 là Producer:
+
+- Đọc audio từ simulated source, WAV hoặc microphone.
+- Ghi mỗi frame vào ring buffer.
+- Chạy VAD nhẹ trên frame.
+- Nếu speech hợp lệ, gom pre-roll + audio speech vào utterance buffer.
+- Đóng segment khi im lặng đủ `speech_end_ms` hoặc chạm `max_utterance_ms`.
+- Đẩy `AudioSegment` vào queue bằng timeout ngắn.
+
+Thread 2 là Consumer:
+
+- Gọi `queue.get(timeout=0.05)` nên không block cứng toàn hệ thống khi queue rỗng.
+- Nếu lấy được segment, gọi ASR adapter, sau đó TTS adapter.
+- Ghi latency ASR/TTS/end-to-end vào `collections.deque(maxlen=512)`.
+
+Queue là `queue.Queue(maxsize=config.queue.max_segments)`, thread-safe và có kích thước
+cố định. Khi queue đầy, `_put_segment()` áp dụng policy:
+
+- `drop_oldest`: bỏ segment cũ để ưu tiên cảnh báo mới.
+- `drop_newest`: bỏ segment mới nếu muốn bảo toàn backlog cũ.
+
+Dừng hệ thống an toàn:
+
+- Producer kết thúc trước.
+- `_stop` event được set.
+- Sentinel `None` được đưa vào queue.
+- Consumer xử lý hết segment đang chờ và thoát.
+
+Tránh memory leak:
+
+- Ring buffer có capacity cố định.
+- Utterance buffer có capacity cố định.
+- Queue có `maxsize`.
+- Error/latency telemetry dùng `deque(maxlen=...)`.
+- Không có list audio toàn cục tăng theo thời gian.
+
+### Phần 4: Tối Ưu Code-switching TTS Anh-Việt
+
+Vấn đề của TTS trong xe điện là cần đọc các câu cảnh báo trộn Anh-Việt:
+
+```text
+Hệ thống đang kiểm tra BMS, phát hiện lỗi Overcurrent trên đường nguồn 24V
+Mã lỗi CAN bus communication timeout
+```
+
+Với model TTS nhỏ dưới 100M parameters, không nên nhúng từ điển tiếng Anh lớn vào model.
+Phương án nhẹ hơn là xử lý ở tầng Text-normalization/Phonemizer trước TTS. Repo đã có
+`TextNormalizer` trong `edge_assistant/tts.py`, dùng regex/rules và dictionary nhỏ:
+
+- `BMS -> bi em ét`
+- `CAN bus -> can bớt`
+- `Overcurrent -> âu vờ cờ rần`
+- `communication -> com mu ni cây shần`
+- `timeout -> thai ao`
+- `24V -> hai mươi bốn vôn`
+- `15% -> mười lăm phần trăm`
+
+Ưu điểm Regex/rules:
+
+- Rất nhẹ về CPU so với ASR/TTS inference.
+- Dễ kiểm soát trong miền từ vựng dashboard xe điện.
+- Dễ thêm/sửa rule mà không retrain model.
+- Không làm tăng kích thước model TTS.
+
+Nhược điểm:
+
+- Cần bảo trì danh sách thuật ngữ.
+- Từ mới có thể bị đọc sai nếu chưa có rule.
+- Cách đọc là quy ước domain, cần thống nhất với người dùng/đội sản phẩm.
+
+So với can thiệp Lexicon/Tokenizer:
+
+- Lexicon/tokenizer có thể chính xác hơn ở mức âm vị nếu model hỗ trợ phoneme đa ngôn ngữ.
+- Nhưng can thiệp sâu hơn vào pipeline model, dễ gây regression, khó test hơn và tốn công
+  bảo trì hơn.
+- Với prototype Edge nhỏ, nên ưu tiên regex/rules; chỉ can thiệp tokenizer khi rule-based
+  không đạt chất lượng đọc các thuật ngữ quan trọng.
+
+### Phần 5: Prosody Control Cho Cảnh Báo Khẩn Cấp
+
+Cảnh báo khẩn cấp cần nói nhanh hơn và rõ hơn nhưng không thêm model nặng. Thiết kế nên
+truyền trực tiếp tham số prosody vào TTS inference:
+
+- `speed`: tăng nhẹ, ví dụ 1.10-1.20.
+- `pitch`: tăng vừa phải, ví dụ 1.05-1.10.
+- `energy`: tăng vừa phải, ví dụ 1.10-1.15.
+- `style_id`: chọn preset `alert` nếu model hỗ trợ.
+
+Trong repo, `TtsConfig` có:
+
+```toml
+default_speed = 1.0
+urgent_speed = 1.18
+default_pitch = 1.0
+urgent_pitch = 1.08
+default_energy = 1.0
+urgent_energy = 1.12
+default_style = "neutral"
+urgent_style = "alert"
+```
+
+`MockTTS.synthesize(text, urgent=True)` trả về `Prosody(speed, pitch, energy, style_id)`
+để chứng minh tham số được truyền qua adapter. Nếu model thật không hỗ trợ pitch trực
+tiếp, có thể dùng preset voice/style đã chuẩn bị sẵn hoặc post-processing nhẹ, nhưng
+phải benchmark lại để đảm bảo active CPU vẫn dưới 70%.
+
+### Phần 6: Quản Lý Queue, Backpressure Và Chống Tràn
+
+Queue có thể đầy khi người dùng nói quá dài, môi trường ồn làm VAD trigger liên tục,
+hoặc ASR/TTS chậm hơn producer. Repo có các cơ chế:
+
+- `queue.max_segments = 8`: giới hạn chunk đang chờ ASR.
+- `put_timeout_ms = 5`: producer không chờ queue quá lâu.
+- `backpressure_policy = "drop_oldest"`: mặc định bỏ segment cũ, giữ cảnh báo mới.
+- `max_utterance_ms = 6000`: cắt utterance quá dài trong simulated config.
+- `cooldown_ms = 250`: cooldown sau mỗi trigger.
+- `warn_at_percent = 0.75`: log warning khi queue gần đầy.
+- Metric: `segments_dropped`, `queue_max_observed`, `queue_near_full_events`,
+  `vad_timeout_segments`.
+
+Tác dụng phụ:
+
+- Có thể mất một phần câu nói nếu drop segment.
+- ASR có thể thiếu ngữ cảnh.
+- Hệ thống có thể cần yêu cầu người dùng nói lại.
+- Đổi lại, RAM không tăng vô hạn và producer không bị block cứng, phù hợp hệ thống Edge
+  cần chạy dài hạn.
+
+### Phần 7: Pseudo-code Python
+
+Pseudo-code theo kiến trúc class, dùng `collections.deque(maxlen=N)` để minh họa ring
+buffer cố định. Source thật trong repo dùng `FixedSizeRingBuffer` bằng `bytearray`, cùng
+mục tiêu: capacity cố định, không tăng theo thời gian.
 
 ```python
+import threading
+import queue
 import time
-from pathlib import Path
-
-import numpy as np
-import psutil
+import collections
 
 
-class VoicePipeline:
-    def __init__(self, asr_model_path, tts_model_path, sample_rate=16000, num_threads=2):
-        self.sample_rate = sample_rate
-        self.num_threads = num_threads
-        self.buffer = []
-        self.recording = False
-        self.process = psutil.Process()
+class AlwaysOnPipeline:
+    def __init__(self, config):
+        self.config = config
 
-        # Load ASR model đúng 1 lần khi chương trình khởi động.
-        # Backend nên là native persistent engine, không load lại mỗi lần bấm nút.
-        self.asr = WhisperCppEngine(
-            model_path=asr_model_path,
-            language="vi",
-            num_threads=num_threads,
-            input_format="pcm_float32",
-        )
+        self.vad = create_vad(config.vad)
+        self.asr = create_asr(config.asr)
+        self.tts = create_tts(config.tts)
 
-        # Load TTS model đúng 1 lần khi chương trình khởi động.
-        self.tts = PiperEngine(
-            model_path=tts_model_path,
-            output_format="pcm_s16le",
-            sample_rate=sample_rate,
-        )
+        ring_frames = int(config.audio.ring_buffer_seconds * 1000 / config.audio.frame_ms)
+        max_utterance_frames = int(config.vad.max_utterance_ms / config.audio.frame_ms)
 
-        # Mở audio output một lần để phát PCM trực tiếp ra loa.
-        self.speaker = AlsaPcmPlayer(
-            sample_rate=sample_rate,
-            channels=1,
-            sample_format="s16le",
-        )
+        self.ring_buffer = collections.deque(maxlen=ring_frames)
+        self.utterance_buffer = collections.deque(maxlen=ring_frames + max_utterance_frames)
 
-    def warm_up(self):
-        # Chạy dummy inference để tránh cold-start latency ở lượt đầu.
-        dummy_pcm = np.zeros(self.sample_rate // 4, dtype=np.float32)
-        _ = self.asr.transcribe_pcm(dummy_pcm)
-        _ = self.tts.synthesize_to_pcm_bytes("xin chao")
+        self.audio_queue = queue.Queue(maxsize=config.queue.max_segments)
+        self.stop_event = threading.Event()
 
-    def start_recording(self):
-        # Sự kiện bấm nút: bắt đầu lượt Push-to-Talk mới.
-        self.buffer.clear()
-        self.recording = True
-        self.record_start_time = time.perf_counter()
+        self.cpu_samples = collections.deque(maxlen=240)
+        self.ram_samples = collections.deque(maxlen=240)
+        self.latency_samples = collections.deque(maxlen=512)
 
-    def on_audio_frame(self, pcm_frame):
-        # Nhận raw PCM frame từ microphone, lưu trong RAM.
-        # Không ghi temp.wav xuống MicroSD/SSD.
-        if not self.recording:
-            return
-        if pcm_frame.ndim != 1:
-            raise ValueError("Expected mono PCM frame")
-        self.buffer.append(np.ascontiguousarray(pcm_frame, dtype=np.float32))
+    def producer_audio_vad_thread(self):
+        in_speech = False
+        speech_ms = 0
+        silence_ms = 0
+        utterance_ms = 0
+        cooldown_until = 0.0
 
-    def stop_and_process(self):
-        # Sự kiện nhả nút: dừng ghi âm và chạy ASR -> TTS -> speaker.
-        if not self.recording:
-            return None
-        self.recording = False
-        if not self.buffer:
-            return None
+        while not self.stop_event.is_set():
+            frame = read_microphone_frame()
+            now = time.time()
 
-        ram_before = self.rss_mb()
+            self.ring_buffer.append(frame)
 
+            if now < cooldown_until:
+                speech_ms = 0
+                silence_ms = 0
+                continue
+
+            vad = self.vad.infer(frame)
+            if vad.speech:
+                speech_ms += self.config.audio.frame_ms
+                silence_ms = 0
+            else:
+                silence_ms += self.config.audio.frame_ms
+                if not in_speech:
+                    speech_ms = 0
+
+            if not in_speech and speech_ms >= self.config.vad.speech_start_ms:
+                in_speech = True
+                utterance_ms = 0
+                self.utterance_buffer.clear()
+                for old_frame in self.ring_buffer:
+                    self.utterance_buffer.append(old_frame)
+
+            if in_speech:
+                self.utterance_buffer.append(frame)
+                utterance_ms += self.config.audio.frame_ms
+
+            should_close = in_speech and silence_ms >= self.config.vad.speech_end_ms
+            should_timeout = in_speech and utterance_ms >= self.config.vad.max_utterance_ms
+
+            if should_close or should_timeout:
+                audio_chunk = b"".join(self.utterance_buffer)
+                self._safe_put(audio_chunk)
+                self.utterance_buffer.clear()
+                in_speech = False
+                speech_ms = 0
+                silence_ms = 0
+                utterance_ms = 0
+                cooldown_until = now + self.config.vad.cooldown_ms / 1000.0
+
+            self._log_cpu_ram()
+
+    def consumer_asr_thread(self):
+        while not self.stop_event.is_set() or not self.audio_queue.empty():
+            try:
+                audio_chunk = self.audio_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            try:
+                text = self.asr.transcribe(audio_chunk)
+                urgent = detect_urgent(text)
+                audio = self.tts.synthesize(text, urgent=urgent)
+                play_audio(audio)
+            finally:
+                self.audio_queue.task_done()
+
+    def _safe_put(self, audio_chunk):
         try:
-            pcm = np.concatenate(self.buffer)
-            audio_duration_sec = len(pcm) / self.sample_rate
+            self.audio_queue.put_nowait(audio_chunk)
+        except queue.Full:
+            if self.config.queue.backpressure_policy == "drop_oldest":
+                try:
+                    self.audio_queue.get_nowait()
+                    self.audio_queue.task_done()
+                except queue.Empty:
+                    pass
+                try:
+                    self.audio_queue.put_nowait(audio_chunk)
+                except queue.Full:
+                    log_warning("drop newest because queue is still full")
+            else:
+                log_warning("drop newest because queue is full")
 
-            start = time.perf_counter()
+    def _log_cpu_ram(self):
+        cpu = read_process_cpu_percent_of_total()
+        rss = read_process_rss_mb()
+        self.cpu_samples.append(cpu)
+        self.ram_samples.append(rss)
 
-            # Truyền raw PCM trực tiếp vào ASR.
-            transcript = self.asr.transcribe_pcm(pcm)
-
-            # TTS sinh PCM audio bytes.
-            tts_pcm_bytes = self.tts.synthesize_to_pcm_bytes(transcript)
-
-            processing_time_sec = time.perf_counter() - start
-            rtf = processing_time_sec / max(audio_duration_sec, 1e-6)
-
-            # Phát PCM trực tiếp ra loa.
-            self.speaker.play_pcm(tts_pcm_bytes)
-
-            ram_after = self.rss_mb()
-            return {
-                "transcript": transcript,
-                "audio_duration_sec": audio_duration_sec,
-                "processing_time_sec": processing_time_sec,
-                "rtf": rtf,
-                "ram_before_mb": ram_before,
-                "ram_after_mb": ram_after,
-                "ram_delta_mb": ram_after - ram_before,
-                "passed_rtf": rtf < 0.3,
-            }
-
-        finally:
-            # Clear buffer sau mỗi lượt để tránh memory leak.
-            self.buffer.clear()
-
-    def save_temp_for_external_process(self, data: bytes, filename="tts_output.pcm"):
-        # Nếu bắt buộc dùng file tạm, dùng /dev/shm vì đây là tmpfs trên RAM.
-        # Không ghi file tạm xuống MicroSD/SSD.
-        base = Path("/dev/shm") if Path("/dev/shm").exists() else Path("/tmp")
-        path = base / filename
-        path.write_bytes(data)
-        return path
-
-    def rss_mb(self):
-        return self.process.memory_info().rss / 1024 / 1024
-
-
-def benchmark_memory_stability(pipeline, test_pcm, loops=50):
-    results = []
-    for i in range(loops):
-        pipeline.start_recording()
-        for frame in split_pcm(test_pcm, frame_size=1600):
-            pipeline.on_audio_frame(frame)
-        result = pipeline.stop_and_process()
-        results.append(result)
-        print(
-            f"loop={i + 1} rtf={result['rtf']:.3f} "
-            f"ram_after={result['ram_after_mb']:.1f}MB "
-            f"ram_delta={result['ram_delta_mb']:.3f}MB"
-        )
-
-    ram_slope = (
-        results[-1]["ram_after_mb"] - results[0]["ram_after_mb"]
-    ) / max(loops - 1, 1)
-    print(f"RAM slope: {ram_slope:.4f} MB/loop")
-    assert ram_slope < 0.05, "Possible memory leak"
-    return results
+    def stop(self):
+        self.stop_event.set()
+        self.producer.join(timeout=2.0)
+        self.consumer.join(timeout=5.0)
+        self.utterance_buffer.clear()
 ```
 
-### Trả lời ngắn 4 câu giải trình
+### Phần 8: Trả Lời 3 Câu Hỏi Giải Trình
 
-1. Chọn `whisper.cpp` hay `sherpa-onnx`?
+1. Code-switching: Nên dùng Text-normalization Regex/Rules trước. Về CPU, rules gần như
+không đáng kể so với inference. Về độ chính xác, rules đủ tốt cho domain hẹp như BMS,
+CAN bus, Overcurrent, 24V, 15%. Về bảo trì, rules dễ sửa hơn retrain/can thiệp tokenizer.
+Lexicon/Tokenizer có thể chính xác âm vị hơn nhưng phức tạp, dễ phá pipeline và cần test
+nhiều hơn.
 
-   Chọn `whisper.cpp` cho repo này vì nhẹ, native C/C++, hỗ trợ Whisper Tiny
-   quantized Q5/Q8/Q4, chạy tốt trên CPU ARM64/NEON và phù hợp offline. Nếu cần
-   ONNX Runtime session persistent, `sherpa-onnx` là phương án thay thế hợp lệ.
+2. Prosody Control: Dùng tham số runtime của TTS như `speed`, `pitch`, `energy`,
+`style_id`. Với cảnh báo khẩn, tăng speed nhẹ và pitch/energy vừa phải, không đổi model
+và không chạy model phụ. Nếu model không hỗ trợ pitch trực tiếp, dùng preset voice/style
+hoặc post-processing nhẹ và phải benchmark lại.
 
-2. Raspberry Pi 5 có 4 nhân vật lý thì nên set `num_threads` bao nhiêu?
+3. Queue & Backpressure: Nên kết hợp queue maxsize, VAD timeout, cooldown và drop policy.
+Nếu cần ưu tiên cảnh báo mới trên dashboard xe, dùng `drop_oldest`; nếu cần bảo toàn thứ
+tự hội thoại, dùng `drop_newest`. Tác dụng phụ là có thể mất một phần câu nói, ASR thiếu
+ngữ cảnh hoặc cần yêu cầu người dùng nói lại. Đổi lại, hệ thống không tràn RAM và không
+bị block cứng.
 
-   Bắt đầu với `num_threads = 2`, sau đó benchmark 1, 2, 3, 4. `4` threads đôi
-   khi chậm hơn `2` vì tranh chấp cache, thread overhead, nghẽn memory bandwidth
-   và thermal throttling.
+## 3. Pipeline Giả Lập / Pipeline Test
 
-3. Nếu TTS bắt buộc lưu file tạm thì lưu ở đâu?
+Repo hiện tại có pipeline simulated để kiểm tra kiến trúc mà không cần model lớn:
 
-   Lưu vào `/dev/shm` trên Linux. Đây là tmpfs trên RAM, nhanh hơn và không làm
-   hao mòn MicroSD/SSD.
+- `SimulatedAudioSource`: tạo frame PCM16 16 kHz. Background mode không có speech; active
+  mode tạo speech-like tone theo chu kỳ.
+- `EnergyVAD`: tính RMS để phân biệt silence/speech trong simulated audio.
+- `MockASR`: mô phỏng chi phí ASR bằng busy work, trả về một trong hai câu cảnh báo:
+  `Hệ thống đang kiểm tra BMS...24V` hoặc `Mã lỗi CAN bus communication timeout`.
+- `MockTTS`: normalize text, gán prosody urgent/neutral, mô phỏng chi phí TTS và trả về
+  payload bytes dạng mock.
 
-4. Chọn FP16, INT8, Q8, Q5 hay Q4?
+Input giả lập:
 
-   Chọn Q5. FP16 chính xác nhưng chậm/tốn RAM, Q8 chính xác nhưng nặng hơn Q5,
-   INT8 phù hợp hơn với backend ONNX INT8, Q4 nhanh nhưng WER delta dễ vượt 2%.
-   Q5 cân bằng tốc độ, RAM và độ chính xác, với WER delta ước tính `0.012`.
+- Frame PCM16 mono, 20 ms, 16 kHz.
+- Background: noise thấp, kỳ vọng không enqueue segment.
+- Active: speech-like signal, kỳ vọng tạo segment và kích hoạt ASR/TTS mock.
 
-## Thiết kế tổng quan
+Output giả lập:
 
-Pipeline được tách thành hai lớp:
+- JSON stats từ pipeline và benchmark.
+- `MockTTS` payload bytes/metadata, chưa phát ra loa.
 
-1. Runtime pipeline: `VoicePipeline` load ASR/TTS khi khởi động, nhận raw PCM
-   chunks, chạy ASR, chạy TTS, đo RTF/RAM và clear buffer sau mỗi lượt.
-2. Benchmark/model-prep: chạy cùng pipeline nhiều vòng để so sánh quantization,
-   thread count, RAM slope và load-once behavior.
+Simulated test chứng minh được:
 
-Thiết kế mong muốn trên thiết bị thật:
+- Threading producer-consumer hoạt động.
+- Ring buffer/utterance buffer không tăng vô hạn.
+- Queue maxsize và drop policy có đường code.
+- Text-normalization và prosody được áp dụng.
+- CPU monitor local có thể so với KPI 40%/70%.
+
+Simulated benchmark không thay thế benchmark trên Raspberry Pi 5 thật. CPU trên máy local
+hoặc Docker ARM64/QEMU chỉ dùng để bắt lỗi logic, không kết luận hiệu năng cuối cùng.
+
+## 4. Code Map
+
+| Đường dẫn | Vai trò |
+| --- | --- |
+| `edge_assistant/main.py` | Entry point CLI để chạy pipeline theo config, mode và duration. |
+| `edge_assistant/pipeline.py` | Core logic: AlwaysOnPipeline, producer-consumer, queue, VAD state, backpressure, stats. |
+| `edge_assistant/audio_source.py` | Audio source: simulated, WAV, microphone qua `sounddevice`. |
+| `edge_assistant/vad.py` | `EnergyVAD` fallback; nơi cần thay bằng Silero/WebRTC VAD. |
+| `edge_assistant/ring_buffer.py` | Fixed-size byte ring buffer cho PCM audio. |
+| `edge_assistant/asr.py` | `MockASR`; nơi cần thay bằng SenseVoiceSmall adapter. |
+| `edge_assistant/tts.py` | `TextNormalizer`, prosody config, `MockTTS`; nơi cần thay bằng Valtec/VieNeu adapter. |
+| `edge_assistant/metrics.py` | Process CPU monitor tính percent trên tổng CPU. |
+| `edge_assistant/config.py` | Dataclass config và loader TOML. |
+| `configs/pipeline.sim.toml` | Config local/simulated benchmark. |
+| `configs/pipeline.rpi.toml` | Config microphone trên Pi, backend vẫn là mock/energy. |
+| `benchmarks/bench_pipeline.py` | Benchmark CPU và pipeline stats, có `--out` JSON. |
+| `tests/test_ring_buffer.py` | Unit test ring buffer overwrite/clear. |
+| `tests/test_tts_normalizer.py` | Unit test code-switching rules và urgent prosody. |
+| `docs/ARCHITECTURE.md` | Mô tả kiến trúc chi tiết. |
+| `docs/BENCHMARK_PLAN.md` | Kế hoạch benchmark local, Docker ARM64, Pi native, soak/backpressure. |
+| `docs/RASPBERRY_PI_DEPLOYMENT.md` | Hướng dẫn Docker ARM64, Pi native, ALSA, systemd. |
+| `docker/Dockerfile.pi-sim` | Image Python 3.11 slim để chạy benchmark simulated. |
+| `docker/compose.pi-sim.yml` | Compose service ARM64 cho benchmark active. |
+| `scripts/docker_run_benchmark.sh` | Script run benchmark trong container ARM64. |
+| `scripts/rpi_install_native.sh` | Cài Python venv và dependency cơ bản trên Raspberry Pi. |
+| `scripts/rpi_run_native.sh` | Chạy pipeline native từ config. |
+| `deploy/systemd/ai-edge-assistant.service` | Service systemd mẫu cho Raspberry Pi. |
+| `outputs/background.local.json` | Kết quả benchmark background local mới nhất. |
+| `outputs/active.local.json` | Kết quả benchmark active local mới nhất. |
+
+## 5. Đã Test Gì
+
+Unit test đã chạy:
+
+```powershell
+& "C:\Users\TinhCute\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m unittest discover -s tests
+```
+
+Kết quả hiện tại:
 
 ```text
-GPIO/software button pressed
-  -> start_recording()
-  -> microphone streams 16 kHz mono PCM frames
-  -> on each frame: append_audio_chunk()
-GPIO/software button released
-  -> stop_and_process()
-  -> Whisper Tiny ASR
-  -> Piper Vietnamese TTS
-  -> speaker playback
+Ran 6 tests in 0.015s
+OK
 ```
 
-Trong code hiện tại, phần lõi `PCM -> ASR -> TTS -> metrics` đã có. Các module
-I/O phần cứng như GPIO button, microphone recorder và speaker player chưa được
-đóng gói thành service hoàn chỉnh.
+Unit test kiểm tra:
 
-## Pipeline giả lập hoạt động như thế nào
+- Ring buffer chỉ giữ byte mới nhất khi vượt capacity.
+- Ghi lớn hơn capacity thay thế bằng suffix mới nhất.
+- `clear()` reset snapshot và size.
+- Text-normalization cho `BMS`, `Overcurrent`, `24V`.
+- Phrase/percent rules cho `CAN bus`, `communication`, `timeout`, `15%`.
+- Urgent prosody truyền `speed`, `pitch`, `energy`, `style_id` vào TTS adapter.
 
-Backend `simulated` dùng để kiểm tra kiến trúc và benchmark nhanh khi chưa có
-Raspberry Pi 5 hoặc chưa build real backend.
+Runtime smoke test đã được bao phủ thông qua benchmark 10 giây:
 
-Luồng giả lập vẫn đi qua cùng `VoicePipeline` như real backend:
+- Background: 500 frames, 0 speech frames, 0 segment, ASR/TTS không chạy.
+- Active: 500 frames, 170 speech frames, 2 segments processed, 0 dropped.
+- Consumer không treo khi queue rỗng.
+- Sentinel shutdown hoạt động.
 
-```text
-generate_synthetic_pcm() hoặc WAV input
-  -> start_recording()
-  -> append_audio_chunk() theo từng frame PCM
-  -> stop_and_process()
-  -> SimulatedASRBackend.transcribe_pcm()
-  -> SimulatedTTSBackend.synthesize_to_pcm_bytes()
-  -> InferenceResult + RTF/RAM metrics
+Benchmark đã đo:
+
+- CPU avg/max theo percent của tổng CPU.
+- Số frame, speech frame.
+- Segment enqueued/processed/dropped.
+- Queue max observed và queue near-full events.
+- VAD timeout segments và cooldown skipped frames.
+- ASR/TTS/end-to-end latency average/max.
+
+Kết quả benchmark hiện có:
+
+- `outputs/background.local.json`
+- `outputs/active.local.json`
+- `outputs/audit.background.local.json` và `outputs/audit.active.local.json` là output
+  cũ hơn trong workspace.
+
+Kết quả nổi bật từ lần benchmark local 10 giây mới nhất:
+
+| Mode | Duration | CPU avg | CPU max | Pass | Enqueued | Processed | Dropped | Queue max | ASR avg | TTS avg | E2E max |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| background | 10s | 1.248% | 3.688% | true | 0 | 0 | 0 | 0 | 0 ms | 0 ms | 0 ms |
+| active | 10s | 1.060% | 2.261% | true | 2 | 2 | 0 | 1 | 20.176 ms | 12.655 ms | 46.644 ms |
+
+Những phần chưa test xong:
+
+- Chưa benchmark trên Raspberry Pi 5 real hardware.
+- Chưa test microphone real/sounddevice trong môi trường xe.
+- Chưa wire/chạy Silero VAD, WebRTC VAD, SenseVoiceSmall, Valtec-TTS, VieNeu-TTS.
+- Chưa có soak test 2-8 giờ để kết luận RAM slope.
+- Chưa có benchmark Docker ARM64 mới trong lần cập nhật README này.
+- Chưa có test audio output ra loa.
+
+## 6. Benchmark
+
+Chạy benchmark local/simulated:
+
+```powershell
+& "C:\Users\TinhCute\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m benchmarks.bench_pipeline --config configs/pipeline.sim.toml --mode background --duration 10 --out outputs/background.local.json
+& "C:\Users\TinhCute\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m benchmarks.bench_pipeline --config configs/pipeline.sim.toml --mode active --duration 10 --out outputs/active.local.json
 ```
 
-Chi tiết mô phỏng:
+Metric được ghi nhận hiện tại:
 
-- Audio input là mono PCM `float32` trong RAM, mặc định 16 kHz.
-- ASR giả lập kiểm tra dtype/shape PCM, tính thời gian xử lý theo `quant`,
-  `num_threads` và độ dài audio.
-- Transcript giả lập deterministic dạng `xin chao robot ma <hash>`, giúp test
-  repeatable.
-- TTS giả lập tạo sóng PCM `int16` bytes trong RAM, không cần file trung gian.
-- `wer_delta_estimate` được gán theo quant: FP16 tốt nhất, Q4 nhanh nhất nhưng
-  WER delta cao hơn.
-- Buffer audio được clear sau mỗi lượt để tránh giữ RAM.
+- `cpu_avg_percent_of_total`: CPU trung bình của process tính theo tổng số core.
+- `cpu_max_percent_of_total`: mẫu CPU cao nhất trong run.
+- `cpu_pass`: so sánh CPU avg với ngưỡng 40% background hoặc 70% active.
+- `frames_seen`: số audio frames producer đã đọc.
+- `vad_speech_frames`: số frames được VAD xem là speech.
+- `segments_enqueued`: số segment đưa vào queue.
+- `segments_processed`: số segment consumer xử lý xong.
+- `segments_dropped`: số segment bị drop do backpressure.
+- `queue_max_observed`: kích thước queue lớn nhất quan sát được.
+- `queue_near_full_events`: số lần queue gần đầy theo `warn_at_percent`.
+- `vad_timeout_segments`: số segment bị cắt do VAD timeout.
+- `cooldown_skipped_frames`: số frame bị bỏ qua trong cooldown.
+- `asr_avg_ms`, `tts_avg_ms`: latency trung bình của adapter mock.
+- `end_to_end_avg_ms`, `end_to_end_max_ms`: latency từ khi segment kết thúc đến khi TTS
+  mock hoàn thành.
 
-Vì vậy simulated benchmark chứng minh được kiến trúc, metrics và memory behavior
-của pipeline Python, nhưng không thay thế benchmark hiệu năng thật của
-`whisper.cpp`/Piper trên Raspberry Pi 5.
+Metric cần có nhưng chưa được benchmark code ghi tự động:
 
-## Lựa chọn backend
+- RAM/RSS slope theo thời gian.
+- p50/p95 latency.
+- False trigger/minute với microphone thật.
+- Power/thermal throttling trên Raspberry Pi 5.
 
-### ASR
+File kết quả:
 
-Backend thật ưu tiên là `whisper.cpp` với Whisper Tiny vì:
+- Local simulated: `outputs/background.local.json`, `outputs/active.local.json`.
+- Docker ARM64 nếu chạy script: `outputs/benchmark.<mode>.docker.json`.
+- Pi native theo plan: `outputs/background.pi.json`, `outputs/active.pi.json`.
 
-- Native C/C++, phù hợp CPU ARM64 và không cần GPU.
-- Hỗ trợ các model GGML/GGUF đã lượng tử hóa như Q8/Q5/Q4.
-- Có thể tận dụng ARM NEON SIMD trên Cortex-A76 khi build native Release.
-- Python chỉ orchestration; inference không chạy bằng Python thuần tuần tự.
+Ý nghĩa mỗi loại benchmark:
 
-Repo cũng có backend `simulated` để test nhanh và CI. Backend này deterministic,
-không thay thế benchmark thật trên Raspberry Pi 5.
+- Local simulated: bắt lỗi logic thread/queue/ring buffer và có baseline CPU trên máy dev.
+- Docker ARM64: bắt lỗi dependency/userland ARM64, nhưng nếu chạy qua QEMU thì CPU không
+  đại diện Pi thật.
+- Raspberry Pi native: mới là benchmark để kết luận đạt KPI 40%/70%.
+- Soak test: cần chạy nhiều giờ để xác nhận RAM không tăng tuyến tính.
 
-### TTS
+## 7. Cách Chạy
 
-Backend thật ưu tiên là Piper TTS cho tiếng Việt vì:
+Chạy test:
 
-- Chạy offline 100%.
-- Model ONNX nhỏ, phù hợp CPU ARM.
-- Có CLI/package phổ biến, dễ đóng gói trong image ARM64.
-
-Lưu ý hiện tại: adapter `whisper.cpp` và `piper` đang gọi CLI qua `subprocess`.
-Python object được tạo một lần, nhưng CLI process có thể load model lại mỗi lượt.
-Để tối ưu latency cuối cùng, nên chuyển sang binding/session persistent nếu
-backend hỗ trợ.
-
-## Lượng tử hóa Whisper Tiny
-
-Model được chuẩn bị dưới các mức:
-
-- `FP16`: `models/whisper/ggml-tiny.bin`
-- `Q8`: `models/whisper/ggml-tiny-q8_0.bin`
-- `Q5`: `models/whisper/ggml-tiny-q5_0.bin`
-- `Q4`: `models/whisper/ggml-tiny-q4_0.bin`
-
-Kết quả model-prep mô phỏng hiện chọn `Q5`:
-
-```text
-selected: models/whisper/ggml-tiny-q5_0.bin
-mean_rtf: 0.19459
-wer_delta_estimate: 0.012
+```powershell
+& "C:\Users\TinhCute\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m unittest discover -s tests
 ```
 
-Lý do chọn `Q5`:
+Nếu trên máy có `python` trong PATH:
 
-- Nhanh hơn và nhẹ RAM/bandwidth hơn FP16/Q8.
-- Giữ độ chính xác tốt hơn Q4.
-- WER delta ước tính `0.012`, dưới ngưỡng suy giảm 2%.
+```powershell
+python -m unittest discover -s tests
+```
 
-`Q4` nhanh hơn trong mô phỏng nhưng bị loại vì WER delta ước tính `0.026`, vượt
-ngưỡng `0.02`.
+Chạy local/simulated pipeline:
 
-## Tối ưu hiệu năng trên Raspberry Pi 5
+```powershell
+python -m edge_assistant.main --config configs/pipeline.sim.toml --mode background --duration 20
+python -m edge_assistant.main --config configs/pipeline.sim.toml --mode active --duration 20
+```
 
-Build `whisper.cpp` native ARM64:
+Chạy local/simulated benchmark:
+
+```powershell
+python -m benchmarks.bench_pipeline --config configs/pipeline.sim.toml --mode background --duration 30 --out outputs/background.local.json
+python -m benchmarks.bench_pipeline --config configs/pipeline.sim.toml --mode active --duration 30 --out outputs/active.local.json
+```
+
+Build Docker ARM64:
+
+```powershell
+docker buildx build --platform linux/arm64 -f docker/Dockerfile.pi-sim -t ai-edge-assistant:pi-sim --load .
+```
+
+Chạy Docker ARM64 benchmark:
+
+```powershell
+docker run --rm --platform linux/arm64 -v ${PWD}\outputs:/opt/edge-assistant/outputs ai-edge-assistant:pi-sim
+```
+
+Hoặc dùng script trên Linux/macOS/Pi:
 
 ```bash
-git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git
-cmake -S whisper.cpp -B whisper.cpp/build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_NATIVE=ON
-cmake --build whisper.cpp/build -j4 --config Release
+./scripts/docker_run_benchmark.sh active 60
+./scripts/docker_run_benchmark.sh background 60
 ```
 
-Khuyến nghị benchmark `num_threads = 1, 2, 3, 4`. Raspberry Pi 5 có 4 nhân vật
-lý, nhưng `4` threads không luôn nhanh nhất vì cache contention, scheduling
-overhead, memory bandwidth và thermal throttling. Điểm bắt đầu hợp lý là `2`
-threads, sau đó chọn cấu hình có `mean_rtf` và `p95_rtf` tốt nhất trên board
-thật.
-
-## Code map
-
-```text
-src/edge_voice_test/pipeline.py
-  VoicePipeline, warm_up(), PTT buffer, ASR/TTS orchestration, RTF/RAM metrics
-
-src/edge_voice_test/runtime.py
-  CLI smoke test, hỗ trợ simulated hoặc real backend, có warm-up mặc định
-
-src/edge_voice_test/backends/base.py
-  BackendConfig, ASR/TTS protocol, backend factory
-
-src/edge_voice_test/backends/simulated.py
-  Backend giả lập deterministic cho test nhanh, có RTF/WER giả lập theo quant
-
-src/edge_voice_test/backends/whisper_cpp.py
-  Adapter gọi whisper.cpp CLI, ưu tiên temp WAV trong /dev/shm
-
-src/edge_voice_test/backends/piper.py
-  Adapter gọi Piper CLI, ưu tiên output temp file trong /dev/shm
-
-benchmarks/benchmark_pipeline.py
-  Benchmark nhiều vòng, ghi CSV, summary JSON, warm-up, RTF/RAM/load-once checks
-
-test_matrix.py
-  Chạy ma trận FP16/Q8/Q5/Q4 x threads 1/2/3/4
-
-scripts/
-  Download model, build ARM64 image, build whisper.cpp, quantize model
-```
-
-## Chạy runtime smoke
-
-Simulated backend:
-
-```powershell
-$env:PYTHONPATH="src"
-python -m edge_voice_test.runtime `
-  --asr-backend simulated `
-  --tts-backend simulated `
-  --duration 2 `
-  --loops 2
-```
-
-Real backend trên Raspberry Pi 5:
+Chạy Raspberry Pi native:
 
 ```bash
-export PYTHONPATH=src
-python -m edge_voice_test.runtime \
-  --asr-backend whisper-cpp \
-  --tts-backend piper \
-  --threads 2 \
-  --quant Q5 \
-  --whisper-model models/whisper/ggml-tiny.bin \
-  --piper-model models/piper/vi_VN-vais1000-medium/vi_VN-vais1000-medium.onnx \
-  --piper-config models/piper/vi_VN-vais1000-medium/vi_VN-vais1000-medium.onnx.json
+chmod +x scripts/rpi_install_native.sh scripts/rpi_run_native.sh
+./scripts/rpi_install_native.sh
+./scripts/rpi_run_native.sh configs/pipeline.rpi.toml
 ```
 
-Runtime mặc định chạy `warm_up()` trước vòng đo chính. Có thể tắt bằng
-`--skip-warm-up` nếu muốn đo cold-start.
-
-## Đã test gì
-
-Unit tests hiện có trong `tests/test_correctness.py` kiểm tra:
-
-- Model ASR/TTS simulated chỉ được load một lần khi tạo `VoicePipeline`.
-- Với Q5 và 2 threads, simulated pipeline đạt RTF nhỏ hơn `0.3`.
-- Push-to-Talk API hoạt động đúng: `start_recording()`, `append_audio_chunk()`,
-  `stop_and_process()`.
-- Pipeline nhận raw PCM trong RAM và trả transcript + TTS bytes.
-- Không tạo `*.wav` hoặc `temp*.wav` trong thư mục làm việc khi dùng simulated
-  backend.
-- `warm_up()` chạy được mà không làm tăng load count của model.
-- PCM sai shape, ví dụ stereo/2D array, bị reject.
-
-Runtime smoke hiện kiểm tra:
-
-- CLI `edge_voice_test.runtime` tạo pipeline, warm-up, chạy một hoặc nhiều vòng
-  PTT giả lập và in JSON result.
-- Output có `runtime_ok`, `rtf`, `ram_before_mb`, `ram_after_mb`,
-  `asr_load_count`, `tts_load_count` và thông tin warm-up.
-
-Benchmark hiện kiểm tra:
-
-- Chạy nhiều loop qua cùng pipeline để đo steady-state.
-- Ghi CSV từng loop vào `results/*.csv`.
-- In summary JSON gồm mean/p95 RTF, wall RTF, ASR/TTS time, RAM slope,
-  load-once pass và memory-leak pass.
-- `test_matrix.py` chạy ma trận `FP16/Q8/Q5/Q4 x threads 1/2/3/4`.
-
-Kết quả đã lưu:
-
-- `results/matrix_summary.csv`: simulated quant/thread matrix.
-- `results/model_prep/model_prep_report.json`: báo cáo chọn model quantized.
-- `results/model_prep/model_prep_summary.csv`: tóm tắt FP16/Q8/Q5/Q4.
-
-Kết quả nổi bật hiện tại:
-
-```text
-Q5, threads=2, audio=5s
-mean_rtf_sim = 0.19459
-wer_delta_estimate = 0.012
-load_once_pass = true
-memory_leak_pass_simple = true
-```
-
-Chưa test xong trong repo:
-
-- GPIO button thật.
-- Microphone thật.
-- Speaker playback thật.
-- End-to-end latency trên Raspberry Pi 5 vật lý.
-- RTF thật của `whisper.cpp` + Piper trên Pi 5.
-
-## Benchmark
-
-Benchmark một cấu hình:
-
-```powershell
-$env:PYTHONPATH="src"
-python benchmarks/benchmark_pipeline.py `
-  --asr-backend simulated `
-  --tts-backend simulated `
-  --quant Q5 `
-  --threads 2 `
-  --duration 5 `
-  --loops 50 `
-  --out results/benchmark_q5_t2.csv
-```
-
-Output summary gồm:
-
-- `mean_asr_time_sec`
-- `mean_tts_time_sec`
-- `mean_total_time_sec`
-- `mean_rtf`, `p95_rtf`
-- `mean_wall_rtf`, `p95_wall_rtf`
-- `ram_slope_mb_per_loop`
-- `load_once_pass`
-- `memory_leak_pass_simple`
-- `rtf_pass`
-
-Chạy ma trận quant/thread:
-
-```powershell
-$env:PYTHONPATH="src"
-python test_matrix.py
-```
-
-Kết quả hiện có trong `results/matrix_summary.csv` cho thấy simulated Q5 với
-2 threads đạt `mean_rtf_sim = 0.19459`, load-once pass và RAM slope gần 0.
-
-## Docker ARM64
-
-Build image ARM64:
-
-```powershell
-docker buildx build --platform linux/arm64 `
-  -t edge-voice-ptt-test:arm64 `
-  -f Dockerfile.arm64 `
-  --load .
-```
-
-Build image có real backend binaries:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_arm64_image.ps1 -RealBackends
-```
-
-Runtime smoke ARM64:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_arm64_runtime.ps1 -Memory 4g
-```
-
-Benchmark ARM64 emulation:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_arm64_emulation.ps1 -Memory 4g
-powershell -ExecutionPolicy Bypass -File .\scripts\run_arm64_emulation.ps1 -Memory 8g
-```
-
-QEMU/ARM64 emulation chỉ chứng minh packaging và compatibility, không được dùng
-để khẳng định RTF thật trên Raspberry Pi 5.
-
-## Model preparation
-
-Download base models:
+Lưu ý: `configs/pipeline.rpi.toml` đã dùng `audio.source = "microphone"` nhưng VAD/ASR/TTS
+vẫn là `energy/mock/mock`. Muốn dùng microphone cần cài optional dependency:
 
 ```bash
-scripts/download_models.sh
+python -m pip install -r requirements-pi.txt
 ```
 
-Build whisper.cpp:
+Cài service systemd mẫu:
 
 ```bash
-scripts/build_whisper_cpp.sh
+sudo cp deploy/systemd/ai-edge-assistant.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ai-edge-assistant.service
 ```
 
-Quantize Whisper Tiny:
+Cần sửa `WorkingDirectory` và `ExecStart` trong service nếu đường dẫn trên Pi khác
+`/home/pi/ai-edge-assistant`.
 
-```bash
-scripts/quantize_whisper_tiny.sh
-```
+Chạy real backend/hardware:
 
-Run model-prep report:
+- Chưa có sẵn trong repo.
+- Cần thay `EnergyVAD` trong `edge_assistant/vad.py`.
+- Cần thay `MockASR` trong `edge_assistant/asr.py`.
+- Cần thay `MockTTS` trong `edge_assistant/tts.py`.
+- Cần thêm audio output/playback sau TTS nếu muốn phát cảnh báo ra loa.
 
-```powershell
-docker run --rm --platform linux/arm64 `
-  -e PYTHONPATH=/app/src `
-  -v "${PWD}\models:/app/models" `
-  -v "${PWD}\results:/app/results" `
-  edge-voice-ptt-test:arm64 `
-  python scripts/prepare_whisper_models.py `
-    --skip-quantize `
-    --threads 2 `
-    --duration 5 `
-    --loops 10 `
-    --results-dir results/model_prep
-```
-
-## Trạng thái hiện tại
+## 8. Trạng Thái Hiện Tại
 
 Đã có:
 
-- Core `VoicePipeline`.
-- Warm-up ASR/TTS trước benchmark.
-- Simulated ASR/TTS backend.
-- Real backend adapters cho `whisper.cpp` và Piper CLI.
-- RTF/RAM/load-once metrics.
-- Benchmark CSV/JSON summary.
-- Quantization/model-prep report.
-- Docker ARM64 path.
+- Skeleton AI Edge assistant Always-on bằng Python 3.11.
+- Config TOML cho simulated và Raspberry Pi microphone mode.
+- Audio source simulated/WAV/microphone.
+- Fixed-size ring buffer thread-safe.
+- Producer-consumer pipeline với queue maxsize.
+- VAD state machine: speech start/end, timeout, cooldown.
+- Backpressure: drop oldest/drop newest.
+- MockASR và MockTTS có busy-work latency để benchmark.
+- Text-normalization code-switching Anh-Việt bằng regex/rules.
+- Prosody urgent/neutral: speed, pitch, energy, style_id.
+- CPU benchmark local.
+- Dockerfile/compose ARM64 simulated.
+- Script cài/chạy trên Pi và service systemd mẫu.
+- Unit tests cho ring buffer và TTS normalizer/prosody.
 
-Chưa có:
+Chưa có trong repo:
 
-- GPIO button service.
-- Microphone recorder service.
-- Speaker playback service.
-- Full end-to-end PTT app trên Raspberry Pi 5.
-- Benchmark vật lý trên Raspberry Pi 5 với mic/loa thật.
-- Persistent native ASR/TTS session thay cho CLI subprocess mỗi lượt.
+- Silero VAD hoặc WebRTC VAD adapter thật.
+- SenseVoiceSmall adapter thật.
+- Valtec-TTS hoặc VieNeu-TTS adapter thật.
+- Audio output/playback ra loa thật.
+- Wake word engine riêng.
+- Intent/NLU/action layer sau ASR.
+- Benchmark RAM slope tự động trong code.
+- Benchmark trên Raspberry Pi 5 real hardware.
+- Soak test nhiều giờ.
+- Test với microphone và nhiều điều kiện noise xe thật.
 
-Kết luận trung thực: repo đã đủ để kiểm chứng lõi inference/benchmark và chuẩn
-bị deployment ARM64. Để thành thiết bị PTT hoàn chỉnh cần thêm lớp hardware I/O
-và benchmark trực tiếp trên Raspberry Pi 5.
+Cần làm tiếp để thành bản hoàn chỉnh:
+
+- Gắn WebRTC/Silero VAD trước, benchmark background CPU trên Pi.
+- Gắn SenseVoiceSmall, đo active CPU/latency với câu lệnh thật.
+- Gắn Valtec-TTS hoặc VieNeu-TTS, map prosody vào API thật của model.
+- Thêm audio playback và chỉnh volume/latency output.
+- Thêm RSS/RAM monitor và soak test 2-8 giờ.
+- Thêm backpressure stress test với ASR/TTS chậm.
+- Thêm tập câu cảnh báo EV thật để kiểm tra code-switching TTS.
+- Chạy benchmark native Pi và nộp output `background.pi.json`, `active.pi.json`.

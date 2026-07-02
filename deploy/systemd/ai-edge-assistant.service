@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Edge Assistant Always-on Pipeline
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/ai-edge-assistant
+Environment=MODE=active
+Environment=DURATION=31536000
+ExecStart=/home/pi/ai-edge-assistant/scripts/rpi_run_native.sh configs/pipeline.rpi.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

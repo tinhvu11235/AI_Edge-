@@ -1,0 +1,42 @@
+[audio]
+source = "microphone"
+device = "default"
+sample_rate = 16000
+frame_ms = 20
+ring_buffer_seconds = 3.0
+simulated_profile = "mixed"
+
+[vad]
+backend = "energy"
+threshold = 950
+speech_start_ms = 80
+speech_end_ms = 450
+max_utterance_ms = 6000
+cooldown_ms = 250
+
+[queue]
+max_segments = 8
+put_timeout_ms = 5
+backpressure_policy = "drop_oldest"
+warn_at_percent = 0.75
+
+[asr]
+backend = "mock"
+work_ms = 18
+
+[tts]
+backend = "mock"
+work_ms = 12
+default_speed = 1.0
+urgent_speed = 1.18
+default_pitch = 1.0
+urgent_pitch = 1.08
+default_energy = 1.0
+urgent_energy = 1.12
+default_style = "neutral"
+urgent_style = "alert"
+
+[benchmark]
+background_cpu_limit_percent = 40.0
+active_cpu_limit_percent = 70.0
+sample_interval_ms = 250

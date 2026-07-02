@@ -1,0 +1,21 @@
+services:
+  ai-edge-assistant:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pi-sim
+    image: ai-edge-assistant:pi-sim
+    platform: linux/arm64
+    volumes:
+      - ../outputs:/opt/edge-assistant/outputs
+    command:
+      - python
+      - -m
+      - benchmarks.bench_pipeline
+      - --config
+      - configs/pipeline.sim.toml
+      - --mode
+      - active
+      - --duration
+      - "30"
+      - --out
+      - outputs/benchmark.active.json

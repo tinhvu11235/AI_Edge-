@@ -1,5 +1,0 @@
-quant,artifact_path,artifact_exists,status,mean_rtf,p95_rtf,mean_wall_rtf,ram_slope_mb_per_loop,wer_delta_estimate,rtf_pass,load_once_pass,memory_leak_pass_simple
-FP16,models/whisper/ggml-tiny.bin,True,ok,0.35459,0.35459,0.007120677480052109,0.001736111111111111,0.0,False,True,True
-Q8,models/whisper/ggml-tiny-q8_0.bin,True,ok,0.23459,0.23459,0.005739684880099957,0.0013020833333333333,0.004,True,True,True
-Q5,models/whisper/ggml-tiny-q5_0.bin,True,ok,0.19459,0.19459,0.004103661300177919,0.0013020833333333333,0.012,True,True,True
-Q4,models/whisper/ggml-tiny-q4_0.bin,True,ok,0.16792333333333334,0.16792333333333334,0.004222404079846456,0.0008680555555555555,0.026,True,True,True
