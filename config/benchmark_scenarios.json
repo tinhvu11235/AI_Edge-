@@ -1,0 +1,19 @@
+{
+  "scenarios": [
+    {
+      "name": "mixed_vi_en",
+      "text": "Tang moment xoan cho cum rotary actuator o khop goi len 15 phan tram, dong thoi check lai sensor vision giup anh.",
+      "purpose": "Primary mixed Vietnamese-English technical command with comma and final sentence boundary."
+    },
+    {
+      "name": "barge_in",
+      "text": "Robot dang bao cao trang thai pin, nhiet do actuator, torque limit, va chuan bi tiep tuc phan tich sensor vision.",
+      "purpose": "Long response used to verify interruption, TTS cancel, and audio buffer flush."
+    }
+  ],
+  "kpi": {
+    "ttft_ms_max": 500,
+    "barge_in_reaction_ms_max": 200,
+    "underruns_allowed": 0
+  }
+}

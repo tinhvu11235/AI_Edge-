@@ -1,9 +1,8 @@
 .git
 .agents
 .codex
-.venv
-__pycache__
-*.pyc
-models
-results
-third_party
+benchmark_results
+build
+build-*
+assignment_ai_edge_3.docx
+*.docx

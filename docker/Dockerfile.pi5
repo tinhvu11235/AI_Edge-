@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    libasound2-dev \
+    ninja-build \
+    pkg-config \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+COPY CMakeLists.txt ./
+COPY src ./src
+
+RUN cmake -S . -B build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DEDGEVOICE_WITH_ALSA=ON \
+  && cmake --build build --target edge_voice_pipeline
+
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libasound2 \
+    procps \
+  && rm -rf /var/lib/apt/lists/* \
+  && mkdir -p /app/results /app/scripts
+
+WORKDIR /app
+COPY --from=build /work/build/edge_voice_pipeline /app/edge_voice_pipeline
+COPY config ./config
+COPY scripts/run_benchmark.sh /app/scripts/run_benchmark.sh
+RUN chmod +x /app/scripts/run_benchmark.sh
+
+ENTRYPOINT ["/app/edge_voice_pipeline"]
+CMD ["--audio=null", "--iterations=3", "--out=/app/results/benchmark.jsonl"]

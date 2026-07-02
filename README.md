@@ -1,708 +1,785 @@
-# Edge Voice-to-Voice Push-to-Talk Runtime
+# AI Edge 3 - Streaming Voice Pipeline siêu thấp độ trễ trên Raspberry Pi 5
 
-Repository này là prototype AI Edge cho luồng Voice-to-Voice offline trên
-Raspberry Pi 5 / Linux ARM64. Mục tiêu kỹ thuật là kiểm chứng pipeline:
+## 1. Giới thiệu dự án
 
-```text
-button down -> record PCM in RAM -> button up -> ASR -> TTS -> audio bytes
-```
+Dự án này là prototype/scaffold cho bài kiểm tra năng lực AI Edge số 3: thiết kế hệ thống giao tiếp giọng nói streaming offline cho robot hình người chạy trên Raspberry Pi 5. Mục tiêu chính là mô phỏng và kiểm chứng kiến trúc bất đồng bộ gồm Streaming ASR partial text, token/sentence splitter thời gian thực, Streaming TTS, jitter buffer và audio output native qua ALSA/PipeWire.
 
-KPI chính: Real Time Factor (RTF) toàn luồng ASR + TTS nhỏ hơn `0.3`, tức
-audio 5 giây cần xử lý dưới 1.5 giây. Benchmark cũng theo dõi RSS RAM qua nhiều
-vòng để phát hiện memory leak.
-
-## Bài trả lời theo đề bài kiểm tra
-
-Phần này là phần giải trình trực tiếp theo từng yêu cầu của bài kiểm tra. Các
-mục phía sau mô tả chi tiết code, cách chạy và benchmark trong repo.
-
-### Phần 1: Thiết kế tổng quan
-
-Pipeline Voice-to-Voice dạng Push-to-Talk:
+Pipeline tổng quát:
 
 ```text
-Người dùng bấm nút
-  -> bắt đầu ghi âm PCM 16 kHz mono vào RAM
-Người dùng nhả nút
-  -> ghép các PCM frame trong RAM
-  -> ASR chuyển audio thành text
-  -> TTS chuyển text thành audio bytes
-  -> phát audio ra loa
-  -> clear buffer, log RTF/RAM
+Microphone stream
+  -> Streaming ASR
+  -> partial text callback
+  -> token/sentence splitter
+  -> TTS text queue
+  -> Streaming TTS
+  -> PCM chunk queue
+  -> Jitter Buffer
+  -> ALSA/PipeWire audio driver
 ```
 
-Trong repo, phần lõi pipeline nằm ở `src/edge_voice_test/pipeline.py`. API hiện
-có:
+Thiết bị đích và backend định hướng:
 
-- `VoicePipeline.__init__()`: tạo ASR/TTS backend một lần.
-- `warm_up()`: chạy dummy ASR/TTS để giảm cold-start latency.
-- `start_recording()`: bắt đầu lượt PTT, clear buffer cũ.
-- `append_audio_chunk()`: nhận raw PCM frame. Hàm này tương đương
-  `on_audio_frame()` trong yêu cầu bài.
-- `stop_and_process()`: dừng ghi, chạy ASR -> TTS, đo RTF/RAM, clear buffer.
+- Raspberry Pi 5, Broadcom BCM2712, 4 nhân Cortex-A76, RAM 4GB/8GB, Linux ARM64.
+- ASR định hướng: Zipformer Multilingual cho streaming thật; Whisper-Tiny chỉ dùng như phương án chunk/sliding window nếu cần.
+- TTS định hướng: Valtec-TTS streaming mode.
+- Audio output: ALSA native trong source hiện có; PipeWire được nêu như hướng triển khai nếu cần routing/spatial audio.
 
-Chọn `whisper.cpp` cho Whisper Tiny trên Raspberry Pi 5 vì:
+KPI của đề bài:
 
-- Là backend C/C++ native, nhẹ, phù hợp CPU ARM64 không GPU.
-- Hỗ trợ model Whisper Tiny đã lượng tử hóa Q8/Q5/Q4.
-- Có thể build Release native để tận dụng ARM NEON SIMD trên Cortex-A76.
-- Python chỉ điều phối pipeline, không chạy inference bằng Python thuần tuần tự.
-- Dễ đóng gói trong Docker ARM64 và chạy offline 100%.
+- TTFT nhỏ hơn 500 ms từ khi kỹ sư dứt câu hoặc dứt mệnh đề đến khi loa robot bắt đầu phát phản hồi.
+- Không có audio crackling, underrun, tiếng nổ lụp bụp hoặc ngắt quãng.
+- Barge-in khẩn cấp như "Dừng lại, tắt động cơ ngay!" phản ứng dưới 200 ms.
 
-Không chọn `sherpa-onnx` làm hướng chính trong repo này vì mục tiêu bài đang tập
-trung vào Whisper Tiny GGML/GGUF và quantization của `whisper.cpp`. Tuy nhiên
-`sherpa-onnx` vẫn là phương án hợp lệ nếu muốn dùng ONNX Runtime session
-persistent.
+Trạng thái quan trọng: repo hiện là simulated/prototype. Chưa có ASR model thật, chưa có Valtec-TTS thật, chưa có benchmark ALSA trên Raspberry Pi 5 trong repo. Các kết quả hiện có trong `benchmark_results/` là benchmark simulated với `--audio=null`.
 
-Chọn Piper TTS cho tiếng Việt vì:
+## 2. Bài trả lời theo đề bài kiểm tra
 
-- Chạy offline 100%.
-- Model ONNX nhỏ, phù hợp CPU ARM.
-- Có tiếng Việt và dễ triển khai trên Linux ARM64.
-- Dễ tích hợp với pipeline Python qua CLI hoặc session/binding nếu có.
+### Phần 1: Thiết kế tổng quan Streaming Voice Pipeline
 
-Nguyên tắc load model:
+Pipeline thiết kế:
 
-- ASR model và TTS model phải được khởi tạo trong `VoicePipeline.__init__()`.
-- Khi người dùng bấm hoặc nhả nút, chương trình chỉ xử lý audio mới.
-- Không load lại model trong mỗi lượt Push-to-Talk.
-- Trong repo hiện tại, simulated backend chứng minh load-once bằng
-  `asr_load_count == 1` và `tts_load_count == 1`.
-- Lưu ý kỹ thuật: adapter real `whisper.cpp`/Piper hiện gọi CLI qua subprocess,
-  nên CLI có thể tự load model lại mỗi lượt. Đây là giới hạn đã ghi rõ; bản tối
-  ưu cuối nên dùng binding/session persistent.
-
-### Phần 2: Lượng tử hóa model
-
-Mức lượng tử hóa được chọn: **Q5** cho Whisper Tiny.
-
-Lý do chọn Q5:
-
-- Cân bằng tốt giữa tốc độ, RAM và độ chính xác.
-- Nhẹ hơn FP16/Q8 nên giảm memory bandwidth, giúp CPU ARM xử lý nhanh hơn.
-- Chính xác hơn Q4, giảm nguy cơ WER tăng quá mức với tiếng Việt.
-- Kết quả mô phỏng hiện có: `mean_rtf = 0.19459`,
-  `wer_delta_estimate = 0.012`, dưới ngưỡng suy giảm WER 2%.
-
-Vì sao Q5 giúp tối ưu tốc độ trên CPU ARM:
-
-- Model nhỏ hơn làm giảm lượng dữ liệu phải đọc từ RAM/cache.
-- CPU Cortex-A76 thường bị giới hạn bởi memory bandwidth khi inference model nhỏ
-  chạy nhiều lớp liên tiếp.
-- Quantized weights giúp backend native dùng kernel tối ưu tốt hơn so với FP16
-  trong môi trường không GPU.
-
-Vì sao không chọn mức khác:
-
-- `FP16`: chính xác nhất nhưng chậm hơn, tốn RAM/bandwidth hơn, khó đạt RTF
-  `< 0.3` trên CPU nếu pipeline còn có TTS.
-- `INT8`: là lựa chọn hợp lý nếu dùng backend INT8 chuẩn như ONNX Runtime, nhưng
-  repo này đang theo flow `whisper.cpp` GGML/GGUF nên dùng Q-format trực tiếp.
-- `Q8`: độ chính xác tốt, nhưng tốc độ/RAM chưa tối ưu bằng Q5.
-- `Q4`: nhanh và nhẹ hơn Q5, nhưng WER delta ước tính `0.026`, vượt ngưỡng 2%.
-
-Điều kiện chất lượng: WER sau lượng tử hóa không được suy giảm quá 2% so với
-bản gốc. Vì vậy Q5 được chọn thay vì Q4.
-
-### Phần 3: Backend và tối ưu hiệu năng
-
-Build `whisper.cpp` trên Raspberry Pi 5 để tận dụng ARM NEON SIMD:
-
-```bash
-git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git
-cmake -S whisper.cpp -B whisper.cpp/build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_NATIVE=ON
-cmake --build whisper.cpp/build -j4 --config Release
+```text
+Microphone stream -> Streaming ASR -> partial text callback
+-> token/sentence splitter -> TTS text queue
+-> Streaming TTS -> PCM chunk queue
+-> Jitter Buffer -> ALSA/PipeWire audio driver
 ```
 
-Cấu hình nguyên tắc:
+Không được đợi người dùng nói xong toàn bộ câu mới chạy TTS vì tổng latency sẽ bị cộng dồn: endpointing của VAD/ASR, final decoding, xử lý text, TTS first chunk và audio prebuffer. Với câu kiểm thử "Tăng moment xoắn cho cụm rotary actuator ở khớp gối lên 15 phần trăm, đồng thời check lại sensor vision giúp anh.", hệ thống có thể phản hồi sớm sau mệnh đề đầu thay vì chờ toàn bộ câu.
 
-- Dùng Linux ARM64 native, không chạy x86 emulation khi benchmark thật.
-- Build `Release`, bật native CPU optimization.
-- Không dùng Python thuần tuần tự cho inference.
-- Python chỉ làm orchestration: nhận PCM, gọi backend native, đo metric, quản lý
-  buffer.
+Cách giảm TTFT là cắt câu/mệnh đề sớm:
 
-Thiết lập `num_threads`:
+- ASR xuất partial text liên tục trong lúc người dùng đang nói.
+- Splitter cắt tại dấu câu hoặc cụm có nghĩa khi segment đủ dài.
+- TTS nhận segment nhỏ qua queue và bắt đầu sinh PCM chunk đầu tiên.
+- Audio output phát từ jitter buffer mà không chờ ASR/TTS hoàn tất toàn bộ câu.
 
-- Raspberry Pi 5 có 4 nhân Cortex-A76 vật lý.
-- Không mặc định chọn `num_threads = 4` cho mọi trường hợp.
-- Điểm khởi đầu hợp lý là `num_threads = 2`, sau đó benchmark 1, 2, 3, 4.
+Trong `src/main.cpp`, pipeline được tách thành nhiều worker:
 
-Vì sao `num_threads = 4` đôi khi chậm hơn `num_threads = 2`:
+- `asr_simulator()` mô phỏng ASR partial callback và đẩy `TextJob` vào `text_queue`.
+- `tts_worker()` lấy `TextJob`, mô phỏng TTS first chunk latency, sinh PCM chunk và đẩy vào `jitter_buffer`.
+- `audio_worker()` prebuffer PCM, ghi ra `AudioSink`, đo TTFT và underrun.
+- Barge-in chạy bằng thread riêng khi truyền `--barge-in-ms`.
 
-- Tranh chấp cache giữa các worker thread.
-- Overhead tạo/lập lịch/sync thread.
-- Nghẽn memory bandwidth khi nhiều thread cùng đọc model weights.
-- Hệ thống vẫn cần CPU cho audio I/O, OS, Python orchestration.
-- Raspberry Pi 5 có thể thermal throttling khi chạy full 4 core lâu.
+ASR, TTS và Audio Output không block lẫn nhau. Các khối giao tiếp qua `BlockingQueue<T>` dùng `mutex`, `condition_variable`, `pop_for()`, `clear()` và `close()`. Đây là điểm cốt lõi để audio thread không bị kẹt bởi ASR/TTS và để ASR vẫn tiếp tục nhận partial khi audio đang phát.
 
-Cách benchmark thực tế:
+### Phần 2: Multilingual Streaming ASR
 
-```bash
-for t in 1 2 3 4; do
-  python benchmarks/benchmark_pipeline.py \
-    --asr-backend whisper-cpp \
-    --tts-backend piper \
-    --quant Q5 \
-    --threads "$t" \
-    --wav sample_5s.wav \
-    --loops 30 \
-    --out "results/pi5_q5_t${t}.csv"
-done
+Yêu cầu nhận diện câu trộn tiếng Việt và tiếng Anh kỹ thuật trong cùng một stream, ví dụ:
+
+```text
+Tăng moment xoắn cho cụm rotary actuator ở khớp gối lên 15 phần trăm,
+đồng thời check lại sensor vision giúp anh.
 ```
 
-Chọn cấu hình có:
+Thiết kế đề xuất:
 
-- `mean_rtf < 0.3`.
-- `p95_rtf < 0.3` nếu muốn chắc hơn cho realtime.
-- `ram_slope_mb_per_loop` gần 0.
-- Transcript vẫn đạt WER trong ngưỡng cho phép.
+- Dùng một Streaming ASR đa ngôn ngữ cho toàn câu, không gọi API chuyển đổi ngôn ngữ thủ công.
+- ASR phải xuất partial result khi người dùng đang nói để splitter có dữ liệu sớm.
+- Không tách pipeline thành tiếng Việt rồi tiếng Anh vì chuyển ngôn ngữ thủ công dễ gây token dropping ở biên như `rotary actuator`, `sensor vision`, `CAN bus`.
+- Giữ context ngắn gồm partial gần nhất, endpoint gần nhất và danh sách hotword kỹ thuật.
 
-### Phần 4: Pseudo-code Python kiến trúc chuẩn
+Ưu tiên Zipformer Multilingual nếu cần streaming thật sự, vì kiến trúc CTC/RNN-T/Transducer phù hợp partial decoding theo frame và endpointing ngắn. Nếu dùng Whisper-Tiny, cần ghi rõ đó là wrapper chunk/sliding window: chạy từng cửa sổ audio ngắn có overlap, giữ prompt/context ngắn và commit token theo timestamp ổn định. Whisper-Tiny kiểu này có thể dùng offline trên Pi 5 nhưng không tự nhiên bằng ASR streaming chuyên dụng.
 
-Pseudo-code dưới đây mô tả kiến trúc đầy đủ mong muốn trên Raspberry Pi 5. Code
-trong repo hiện đã có phần lõi tương ứng, nhưng chưa có GPIO/mic/speaker service
-thật.
+Trong repo hiện tại chưa có ASR thật. `asr_simulator()` chỉ mô phỏng partial text từ chuỗi scenario có sẵn. Adapter ASR thật cần thay vào vị trí callback:
+
+```cpp
+void asr_streaming_callback(std::string partial_text) {
+  for (auto segment : splitter.process_partial(partial_text)) {
+    text_queue.push(TextJob{next_id(), current_epoch(), segment, Clock::now()});
+  }
+}
+```
+
+### Phần 3: Token/Sentence Splitting thời gian thực
+
+`SentenceSplitter` nhận partial text từ ASR callback và chỉ emit phần text mới chưa xử lý. Mục tiêu là không đợi toàn bộ câu kết thúc nhưng vẫn tránh cắt quá vụn.
+
+Thuật toán trong source hiện có:
+
+1. Normalize partial bằng `collapse_spaces()`.
+2. Giữ `emitted_pos_` làm vị trí text đã commit.
+3. Giữ `emitted_segments_` để chống gửi trùng partial đã xử lý.
+4. Nếu gặp hard boundary `, . ? ! ; :`, cắt segment nếu đạt `split_min_tokens`.
+5. Nếu partial quá dài, cắt mềm khi số token đạt `split_max_tokens`.
+6. Cắt mềm ưu tiên marker như "đồng thời", "sau đó", "rồi", "và", "and", "then".
+7. `reconcile_partial_correction()` xử lý trường hợp ASR sửa hoặc truncate partial trước đó.
+8. `flush()` phát phần còn lại khi ASR kết thúc.
+
+Tham số hiện có:
+
+- `--split-min-tokens`: mặc định 4, tương ứng ngưỡng tối thiểu 4-6 token trong đề bài.
+- `--split-max-tokens`: mặc định 16, tương ứng ngưỡng tối đa 12-16 token trong đề bài.
+
+Repo chưa có VAD timestamp hoặc silence detector thật. Vì vậy ngưỡng 300-500 ms im lặng ngắn mới nằm ở mức thiết kế, chưa được hiện thực trong code.
+
+### Phần 4: Streaming TTS và Jitter Buffer
+
+TTS nhận từng đoạn text nhỏ từ `text_queue`, không nhận cả câu dài. Trong source hiện tại, `tts_worker()` chưa gọi Valtec-TTS thật mà mô phỏng bằng:
+
+- `tts_first_chunk_ms`: mặc định 80 ms.
+- `tts_chunk_ms`: mặc định 40 ms audio mỗi chunk.
+- `tts_inter_chunk_gap_ms`: mặc định 22 ms giữa các chunk.
+- `generate_pcm_chunk()`: sinh sine PCM S16_LE để đo scheduling.
+
+PCM chunk được đưa vào `jitter_buffer`, không ghi thẳng xuống loa. `audio_worker()` gom `local_prebuffer` đến khi đủ `jitter_ms` trước khi phát. Mặc định `jitter_ms=60`, nằm trong đề xuất prebuffer 40-80 ms.
+
+Jitter Buffer là bắt buộc vì TTS streaming không đảm bảo inter-arrival đều tuyệt đối. Nếu TTS chậm vài chục ms mà audio driver đã cần period tiếp theo, ALSA/PipeWire có thể underrun và gây crackling. Buffer cần đủ nhỏ để không tăng TTFT quá mức:
+
+- Prebuffer đề xuất: 40-80 ms.
+- Target buffer đề xuất: 80-150 ms.
+- Nếu buffer thấp: ưu tiên sinh TTS nhanh hơn hoặc chèn silence rất ngắn có fade để tránh pop.
+- Nếu buffer đầy: không prebuffer thêm quá nhiều để tránh tăng latency.
+
+### Phần 5: Audio Output Pipeline dùng ALSA hoặc PipeWire
+
+Repo có module phát PCM raw qua `AudioSink`:
+
+- `NullAudioSink`: mô phỏng thời gian phát, dùng cho benchmark không có audio hardware.
+- `WavAudioSink`: ghi WAV để kiểm tra dữ liệu PCM.
+- `AlsaAudioSink`: ghi trực tiếp ALSA khi build với `EDGEVOICE_WITH_ALSA=ON`.
+
+Logic ALSA trong `AlsaAudioSink`:
+
+- `snd_pcm_open()` mở playback device.
+- `snd_pcm_hw_params_set_access(... SND_PCM_ACCESS_RW_INTERLEAVED)`.
+- `snd_pcm_hw_params_set_format(... SND_PCM_FORMAT_S16_LE)`.
+- `snd_pcm_hw_params_set_channels()`.
+- `snd_pcm_hw_params_set_rate_near()`.
+- `snd_pcm_hw_params_set_period_size_near()`.
+- `snd_pcm_hw_params_set_buffer_size_near()`.
+- `snd_pcm_writei()` ghi PCM frames.
+- Nếu xrun `-EPIPE`: gọi `snd_pcm_prepare()`.
+- Nếu lỗi âm: gọi `snd_pcm_recover()`.
+- Khi barge-in: `snd_pcm_drop()` rồi `snd_pcm_prepare()`.
+
+Không nên lạm dụng thư viện phát audio cấp cao vì các lớp này thường có buffer ẩn, resampling ẩn hoặc scheduler riêng, làm khó kiểm soát TTFT và barge-in.
+
+Ảnh hưởng tham số:
+
+- `buffer_size` quá nhỏ: ít dữ liệu dự phòng, nhiều interrupt, CPU cao, dễ crackling/underrun.
+- `buffer_size` quá lớn: tăng latency, TTFT và thời gian âm thanh cũ còn nằm trong driver.
+- `period_size` nhỏ: phản ứng nhanh hơn nhưng interrupt dày hơn.
+- `period_size` lớn: ổn định hơn nhưng tăng độ trễ phản ứng.
+
+Benchmark Pi 5 cần sweep `period_ms`, `buffer_ms`, `jitter_ms`, đo `underruns`, `max_audio_gap_ms`, TTFT, CPU và thermal.
+
+### Phần 6: Tránh hallucination/repetition trong Streaming ASR
+
+ASR đa ngôn ngữ streaming dễ gặp lỗi lặp như "rotary rotary rotary", đặc biệt khi audio nhiễu, context quá dài hoặc model bị bias mạnh bởi hotword tiếng Anh.
+
+Cấu hình decoding đề xuất:
+
+- Bắt đầu bằng greedy search để giữ latency thấp.
+- Nếu cần beam search, chỉ dùng beam size 2-3.
+- Dùng repetition penalty hoặc no-repeat-ngram nhẹ nếu backend hỗ trợ.
+- Với CTC/RNN-T, dùng blank penalty và endpointing phù hợp để không commit quá sớm hoặc quá muộn.
+- Giới hạn context window để tránh model bị kẹt vòng lặp.
+- Dùng hotword/context biasing nhỏ cho `rotary actuator`, `BMS`, `CAN bus`, `sensor vision`.
+
+Không dùng beam quá lớn vì tăng CPU, RAM và decoding latency trên Cortex-A76. Beam lớn cũng làm partial result dao động nhiều hơn, khiến splitter khó quyết định commit và có thể đẩy TTFT vượt 500 ms.
+
+Repo hiện chưa có ASR decoder thật nên các cấu hình trên chưa nằm trong code; đây là phần giải trình thiết kế cho adapter ASR thật.
+
+### Phần 7: Chiến lược tối ưu ALSA period_size và buffer_size
+
+Chiến lược khởi đầu trên Pi 5:
+
+- `sample_rate`: 22050 Hz hoặc 24000 Hz tùy output của TTS.
+- `period_ms`: 10-20 ms.
+- `buffer_ms`: 3-4 periods, ví dụ 80-160 ms.
+- `jitter_ms`: 40-80 ms.
+
+Công thức:
+
+```text
+period_ms = period_size / sample_rate * 1000
+buffer_ms = buffer_size / sample_rate * 1000
+period_size = sample_rate * period_ms / 1000
+buffer_size = sample_rate * buffer_ms / 1000
+```
+
+Với 24000 Hz:
+
+- 20 ms period = 480 frames.
+- 120 ms buffer = 2880 frames.
+- 60 ms jitter = 1440 frames.
+
+Benchmark tuning:
+
+1. Bắt đầu `period_ms=20`, `buffer_ms=120`, `jitter_ms=60`.
+2. Đo `underruns`, `max_audio_gap_ms`, `ttft_max_ms`, CPU usage và nhiệt độ.
+3. Nếu crackling hoặc underrun: tăng nhẹ `buffer_ms` hoặc `jitter_ms`; chỉ tăng `period_ms` khi CPU bị interrupt pressure.
+4. Nếu TTFT cao: giảm `jitter_ms`, sau đó giảm `buffer_ms`.
+5. Mục tiêu là đủ an toàn cho audio nhưng không làm tổng phản hồi vượt 500 ms.
+
+### Phần 8: Xử lý Barge-in dưới 200 ms
+
+Khi robot đang nói mà kỹ sư hô "Dừng lại, tắt động cơ ngay!", pipeline cần xử lý theo fast path:
+
+1. ASR/VAD vẫn nghe trong lúc TTS phát.
+2. Barge-in detector phân loại đây là lệnh khẩn cấp.
+3. Đặt `cancel_token` hoặc tăng `epoch`.
+4. TTS worker dừng sinh chunk mới.
+5. Xóa `text_queue` chưa xử lý.
+6. Xóa PCM queue và Jitter Buffer.
+7. Nếu dùng ALSA, gọi `snd_pcm_drop()` để cắt audio trong driver, sau đó `snd_pcm_prepare()`.
+8. Ưu tiên xử lý lệnh khẩn cấp mới bằng epoch mới.
+
+Trong source hiện có:
+
+- `RunState::epoch` là atomic generation id.
+- `flush_audio_pipeline()` tăng epoch, clear `text_queue`, clear `jitter_buffer`, set `flush_requested`.
+- `tts_worker()` kiểm tra epoch trước mỗi PCM chunk.
+- `audio_worker()` khi thấy `flush_requested` sẽ clear prebuffer, clear jitter buffer và gọi `sink->flush()`.
+- `AlsaAudioSink::flush()` gọi `snd_pcm_drop()` và `snd_pcm_prepare()`.
+
+Cách đảm bảo dưới 200 ms là không chờ TTS hoàn tất và không chờ audio buffer phát hết. Hệ thống dùng cancel flag/epoch và flush buffer ngay. Với chunk 20-40 ms, period 10-20 ms và driver flush trực tiếp, đường phản ứng có biên an toàn tốt; tuy nhiên repo hiện mới chứng minh trên null sink simulated, chưa chứng minh trên ALSA thật.
+
+### Phần 9: Pseudo-code Python cho ASR, splitter, TTS, jitter buffer và audio output
 
 ```python
+import queue
+import threading
 import time
-from pathlib import Path
-
-import numpy as np
-import psutil
 
 
-class VoicePipeline:
-    def __init__(self, asr_model_path, tts_model_path, sample_rate=16000, num_threads=2):
-        self.sample_rate = sample_rate
-        self.num_threads = num_threads
-        self.buffer = []
-        self.recording = False
-        self.process = psutil.Process()
+class CancelToken:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._epoch = 0
+        self.flush_requested = threading.Event()
 
-        # Load ASR model đúng 1 lần khi chương trình khởi động.
-        # Backend nên là native persistent engine, không load lại mỗi lần bấm nút.
-        self.asr = WhisperCppEngine(
-            model_path=asr_model_path,
-            language="vi",
-            num_threads=num_threads,
-            input_format="pcm_float32",
-        )
+    def epoch(self):
+        with self._lock:
+            return self._epoch
 
-        # Load TTS model đúng 1 lần khi chương trình khởi động.
-        self.tts = PiperEngine(
-            model_path=tts_model_path,
-            output_format="pcm_s16le",
-            sample_rate=sample_rate,
-        )
+    def cancel(self):
+        with self._lock:
+            self._epoch += 1
+        self.flush_requested.set()
 
-        # Mở audio output một lần để phát PCM trực tiếp ra loa.
-        self.speaker = AlsaPcmPlayer(
-            sample_rate=sample_rate,
-            channels=1,
-            sample_format="s16le",
-        )
 
-    def warm_up(self):
-        # Chạy dummy inference để tránh cold-start latency ở lượt đầu.
-        dummy_pcm = np.zeros(self.sample_rate // 4, dtype=np.float32)
-        _ = self.asr.transcribe_pcm(dummy_pcm)
-        _ = self.tts.synthesize_to_pcm_bytes("xin chao")
+class RealtimeSplitter:
+    def __init__(self, min_tokens=4, max_tokens=16):
+        self.min_tokens = min_tokens
+        self.max_tokens = max_tokens
+        self.last_emitted_pos = 0
+        self.last_partial = ""
+        self.emitted_segments = set()
 
-    def start_recording(self):
-        # Sự kiện bấm nút: bắt đầu lượt Push-to-Talk mới.
-        self.buffer.clear()
-        self.recording = True
-        self.record_start_time = time.perf_counter()
+    def process_partial(self, partial_text):
+        text = " ".join(partial_text.strip().split())
 
-    def on_audio_frame(self, pcm_frame):
-        # Nhận raw PCM frame từ microphone, lưu trong RAM.
-        # Không ghi temp.wav xuống MicroSD/SSD.
-        if not self.recording:
+        # ASR có thể sửa partial cũ; phần đã emit không phát lại.
+        if len(text) < self.last_emitted_pos:
+            self.last_emitted_pos = len(text)
+
+        pending = text[self.last_emitted_pos:]
+        out = []
+
+        boundary = self._first_boundary(pending)
+        if boundary is not None:
+            segment = pending[: boundary + 1].strip()
+            if len(segment.split()) >= self.min_tokens:
+                self._emit(segment, out)
+                self.last_emitted_pos += boundary + 1
+                self.last_partial = text
+                return out
+
+        tokens = pending.split()
+        if len(tokens) >= self.max_tokens:
+            segment = " ".join(self._cut_at_clause_marker(tokens))
+            self._emit(segment, out)
+            self.last_emitted_pos += len(segment)
+
+        self.last_partial = text
+        return out
+
+    def flush(self):
+        out = []
+        self._emit(self.last_partial[self.last_emitted_pos :].strip(), out)
+        return out
+
+    def _emit(self, segment, out):
+        normalized = " ".join(segment.split())
+        if normalized and normalized not in self.emitted_segments:
+            self.emitted_segments.add(normalized)
+            out.append(normalized)
+
+    def _first_boundary(self, text):
+        positions = [text.find(ch) for ch in [",", ".", "?", "!", ";", ":"]]
+        positions = [p for p in positions if p >= 0]
+        return min(positions) if positions else None
+
+    def _cut_at_clause_marker(self, tokens):
+        markers = {"đồng", "sau", "rồi", "và", "and", "then"}
+        for i in range(min(len(tokens), self.max_tokens) - 1, self.min_tokens - 1, -1):
+            if tokens[i].lower() in markers:
+                return tokens[: i + 1]
+        return tokens[: self.max_tokens]
+
+
+class AudioDevice:
+    def open(self, sample_rate, channels, fmt, period_size, buffer_size):
+        # ALSA thật: snd_pcm_open + hw_params + snd_pcm_prepare.
+        pass
+
+    def write_pcm(self, pcm_chunk):
+        # ALSA thật: snd_pcm_writei(handle, frames).
+        return True
+
+    def flush(self):
+        # ALSA thật: snd_pcm_drop(handle); snd_pcm_prepare(handle).
+        pass
+
+
+text_queue = queue.Queue()
+pcm_audio_queue = queue.Queue()
+jitter_buffer = queue.Queue()
+cancel_token = CancelToken()
+splitter = RealtimeSplitter(min_tokens=4, max_tokens=16)
+
+
+def asr_streaming_callback(partial_text):
+    current_epoch = cancel_token.epoch()
+    for segment in splitter.process_partial(partial_text):
+        text_queue.put({
+            "epoch": current_epoch,
+            "text": segment,
+            "boundary_time": time.monotonic(),
+        })
+
+
+def tts_audio_stream_worker(valtec_tts):
+    while True:
+        job = text_queue.get()
+        if job is None:
             return
-        if pcm_frame.ndim != 1:
-            raise ValueError("Expected mono PCM frame")
-        self.buffer.append(np.ascontiguousarray(pcm_frame, dtype=np.float32))
+        if job["epoch"] != cancel_token.epoch():
+            continue
 
-    def stop_and_process(self):
-        # Sự kiện nhả nút: dừng ghi âm và chạy ASR -> TTS -> speaker.
-        if not self.recording:
-            return None
-        self.recording = False
-        if not self.buffer:
-            return None
+        for pcm_chunk in valtec_tts.stream(job["text"]):
+            if job["epoch"] != cancel_token.epoch():
+                break
+            pcm_audio_queue.put({
+                "epoch": job["epoch"],
+                "pcm": pcm_chunk,
+                "boundary_time": job["boundary_time"],
+            })
 
-        ram_before = self.rss_mb()
+
+def jitter_worker(target_ms=120):
+    buffered_ms = 0
+    while True:
+        item = pcm_audio_queue.get()
+        if item is None:
+            jitter_buffer.put(None)
+            return
+        if item["epoch"] != cancel_token.epoch():
+            continue
+
+        jitter_buffer.put(item)
+        buffered_ms += item["pcm"].duration_ms
+        if buffered_ms > target_ms:
+            time.sleep(0.005)
+
+
+def audio_output_worker(audio_device):
+    audio_device.open(
+        sample_rate=24000,
+        channels=1,
+        fmt="S16_LE",
+        period_size=480,
+        buffer_size=2880,
+    )
+
+    while True:
+        if cancel_token.flush_requested.is_set():
+            flush_audio_pipeline(audio_device)
+            cancel_token.flush_requested.clear()
 
         try:
-            pcm = np.concatenate(self.buffer)
-            audio_duration_sec = len(pcm) / self.sample_rate
+            item = jitter_buffer.get(timeout=0.02)
+        except queue.Empty:
+            log_underrun("jitter buffer empty")
+            continue
 
-            start = time.perf_counter()
+        if item is None:
+            return
+        if item["epoch"] != cancel_token.epoch():
+            continue
 
-            # Truyền raw PCM trực tiếp vào ASR.
-            transcript = self.asr.transcribe_pcm(pcm)
-
-            # TTS sinh PCM audio bytes.
-            tts_pcm_bytes = self.tts.synthesize_to_pcm_bytes(transcript)
-
-            processing_time_sec = time.perf_counter() - start
-            rtf = processing_time_sec / max(audio_duration_sec, 1e-6)
-
-            # Phát PCM trực tiếp ra loa.
-            self.speaker.play_pcm(tts_pcm_bytes)
-
-            ram_after = self.rss_mb()
-            return {
-                "transcript": transcript,
-                "audio_duration_sec": audio_duration_sec,
-                "processing_time_sec": processing_time_sec,
-                "rtf": rtf,
-                "ram_before_mb": ram_before,
-                "ram_after_mb": ram_after,
-                "ram_delta_mb": ram_after - ram_before,
-                "passed_rtf": rtf < 0.3,
-            }
-
-        finally:
-            # Clear buffer sau mỗi lượt để tránh memory leak.
-            self.buffer.clear()
-
-    def save_temp_for_external_process(self, data: bytes, filename="tts_output.pcm"):
-        # Nếu bắt buộc dùng file tạm, dùng /dev/shm vì đây là tmpfs trên RAM.
-        # Không ghi file tạm xuống MicroSD/SSD.
-        base = Path("/dev/shm") if Path("/dev/shm").exists() else Path("/tmp")
-        path = base / filename
-        path.write_bytes(data)
-        return path
-
-    def rss_mb(self):
-        return self.process.memory_info().rss / 1024 / 1024
+        ok = audio_device.write_pcm(item["pcm"])
+        if not ok:
+            log_underrun("audio write failed or ALSA xrun")
 
 
-def benchmark_memory_stability(pipeline, test_pcm, loops=50):
-    results = []
-    for i in range(loops):
-        pipeline.start_recording()
-        for frame in split_pcm(test_pcm, frame_size=1600):
-            pipeline.on_audio_frame(frame)
-        result = pipeline.stop_and_process()
-        results.append(result)
-        print(
-            f"loop={i + 1} rtf={result['rtf']:.3f} "
-            f"ram_after={result['ram_after_mb']:.1f}MB "
-            f"ram_delta={result['ram_delta_mb']:.3f}MB"
-        )
+def flush_audio_pipeline(audio_device):
+    clear_queue(text_queue)
+    clear_queue(pcm_audio_queue)
+    clear_queue(jitter_buffer)
+    audio_device.flush()
 
-    ram_slope = (
-        results[-1]["ram_after_mb"] - results[0]["ram_after_mb"]
-    ) / max(loops - 1, 1)
-    print(f"RAM slope: {ram_slope:.4f} MB/loop")
-    assert ram_slope < 0.05, "Possible memory leak"
-    return results
+
+def on_barge_in_urgent_command(command_text):
+    cancel_token.cancel()
+    dispatch_safety_command(command_text)
+
+
+def clear_queue(q):
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+
+def log_underrun(reason):
+    print({"event": "underrun", "reason": reason, "ts": time.monotonic()})
 ```
 
-### Trả lời ngắn 4 câu giải trình
+### Phần 10: Trả lời 3 câu hỏi giải trình
 
-1. Chọn `whisper.cpp` hay `sherpa-onnx`?
+#### 1. Tránh hallucination/repetition trong ASR đa ngôn ngữ streaming
 
-   Chọn `whisper.cpp` cho repo này vì nhẹ, native C/C++, hỗ trợ Whisper Tiny
-   quantized Q5/Q8/Q4, chạy tốt trên CPU ARM64/NEON và phù hợp offline. Nếu cần
-   ONNX Runtime session persistent, `sherpa-onnx` là phương án thay thế hợp lệ.
+Nên chọn greedy search làm baseline vì latency thấp và phù hợp KPI TTFT. Nếu môi trường nhiễu hoặc thuật ngữ tiếng Anh khó, dùng beam search nhỏ 2-3. Không dùng beam lớn vì tăng decoding time, CPU/RAM và làm partial result dao động.
 
-2. Raspberry Pi 5 có 4 nhân vật lý thì nên set `num_threads` bao nhiêu?
+Penalty nên đặt nhẹ: repetition penalty hoặc no-repeat-ngram 2/3 chỉ để chặn lặp bất thường như "rotary rotary rotary". Với CTC/RNN-T, ưu tiên blank penalty và endpointing hợp lý. Hotword bias cho `rotary actuator`, `sensor vision`, `CAN bus`, `BMS` phải nhỏ để không hallucinate thuật ngữ khi người dùng không nói.
 
-   Bắt đầu với `num_threads = 2`, sau đó benchmark 1, 2, 3, 4. `4` threads đôi
-   khi chậm hơn `2` vì tranh chấp cache, thread overhead, nghẽn memory bandwidth
-   và thermal throttling.
+#### 2. Tối ưu ALSA Driver
 
-3. Nếu TTS bắt buộc lưu file tạm thì lưu ở đâu?
+`period_size` quyết định độ dày interrupt/audio callback. Period nhỏ giảm latency nhưng tăng interrupt pressure; period lớn ổn định hơn nhưng phản ứng chậm. `buffer_size` quyết định lượng audio dự phòng trong driver. Buffer nhỏ dễ underrun/crackling; buffer lớn tăng latency, TTFT và làm barge-in khó cắt nếu không flush driver.
 
-   Lưu vào `/dev/shm` trên Linux. Đây là tmpfs trên RAM, nhanh hơn và không làm
-   hao mòn MicroSD/SSD.
-
-4. Chọn FP16, INT8, Q8, Q5 hay Q4?
-
-   Chọn Q5. FP16 chính xác nhưng chậm/tốn RAM, Q8 chính xác nhưng nặng hơn Q5,
-   INT8 phù hợp hơn với backend ONNX INT8, Q4 nhanh nhưng WER delta dễ vượt 2%.
-   Q5 cân bằng tốc độ, RAM và độ chính xác, với WER delta ước tính `0.012`.
-
-## Thiết kế tổng quan
-
-Pipeline được tách thành hai lớp:
-
-1. Runtime pipeline: `VoicePipeline` load ASR/TTS khi khởi động, nhận raw PCM
-   chunks, chạy ASR, chạy TTS, đo RTF/RAM và clear buffer sau mỗi lượt.
-2. Benchmark/model-prep: chạy cùng pipeline nhiều vòng để so sánh quantization,
-   thread count, RAM slope và load-once behavior.
-
-Thiết kế mong muốn trên thiết bị thật:
+Công thức:
 
 ```text
-GPIO/software button pressed
-  -> start_recording()
-  -> microphone streams 16 kHz mono PCM frames
-  -> on each frame: append_audio_chunk()
-GPIO/software button released
-  -> stop_and_process()
-  -> Whisper Tiny ASR
-  -> Piper Vietnamese TTS
-  -> speaker playback
+period_ms = period_size / sample_rate * 1000
+buffer_ms = buffer_size / sample_rate * 1000
 ```
 
-Trong code hiện tại, phần lõi `PCM -> ASR -> TTS -> metrics` đã có. Các module
-I/O phần cứng như GPIO button, microphone recorder và speaker player chưa được
-đóng gói thành service hoàn chỉnh.
+Benchmark trên Pi 5 nên bắt đầu 24000 Hz, period 20 ms, buffer 120 ms, jitter 60 ms. Nếu crackling, tăng buffer/jitter nhẹ. Nếu TTFT cao, giảm jitter trước, sau đó giảm buffer. Chỉ giảm period xuống 10 ms khi CPU còn dư và underrun vẫn bằng 0.
 
-## Pipeline giả lập hoạt động như thế nào
+#### 3. Xử lý Interrupt/Barge-in dưới 200 ms
 
-Backend `simulated` dùng để kiểm tra kiến trúc và benchmark nhanh khi chưa có
-Raspberry Pi 5 hoặc chưa build real backend.
+Khi robot đang nói, ASR/VAD vẫn chạy để phát hiện người chen ngang. Khi có lệnh khẩn cấp, hệ thống tăng `epoch` hoặc đặt `cancel_token`, xóa text queue, dừng TTS ở chunk boundary gần nhất, xóa PCM queue/jitter buffer, gọi `snd_pcm_drop()`/`snd_pcm_prepare()` nếu dùng ALSA, rồi xử lý lệnh mới với priority cao.
 
-Luồng giả lập vẫn đi qua cùng `VoicePipeline` như real backend:
+Điểm quan trọng là không chờ TTS hoàn tất và không chờ audio buffer phát hết. Đường interrupt phải là fast path riêng, không đi qua queue phản hồi bình thường.
+
+## 3. Pipeline giả lập hoặc pipeline test
+
+Repo hiện có pipeline giả lập trong `src/main.cpp`.
+
+Input giả lập:
+
+- Scenario mặc định `mixed_vi_en`: câu tiếng Việt pha tiếng Anh kỹ thuật.
+- Scenario `barge_in`: câu phản hồi dài để mô phỏng robot đang nói khi bị ngắt.
+- Có thể truyền `--text=...` để override input.
+
+ASR giả lập:
+
+- `make_partials()` chia input thành partial text theo `--asr-words-per-partial`.
+- `asr_simulator()` sleep `--asr-partial-ms` giữa các partial.
+- Partial đi qua `SentenceSplitter` rồi vào `text_queue`.
+
+TTS giả lập:
+
+- `tts_worker()` sleep `--tts-first-chunk-ms` trước chunk đầu.
+- `generate_pcm_chunk()` sinh sine wave PCM S16_LE.
+- PCM chunk có duration `--tts-chunk-ms`, số chunk mỗi segment là `--tts-chunks-per-segment`.
+
+Audio giả lập:
+
+- `--audio=null`: không phát loa, chỉ sleep tương ứng duration PCM để mô phỏng playback timing.
+- `--audio=wav`: ghi WAV output.
+- `--audio=alsa`: ghi ALSA thật nếu build có ALSA và host có audio device.
+
+Simulated test chứng minh được:
+
+- Thread/queue scheduling của pipeline.
+- Cơ chế split partial text thành segment.
+- TTS chunk streaming vào jitter buffer.
+- TTFT từ lúc segment boundary đến lúc audio worker bắt đầu phát chunk đầu.
+- Barge-in path: tăng epoch, clear queue, flush audio sink.
+
+Simulated benchmark không thay thế benchmark thật trên Raspberry Pi 5. Nó không đo latency thật của microphone, ASR model, Valtec-TTS, ALSA device thật, spatial audio stack, CPU thermal hoặc crackling nghe thực tế.
+
+## 4. Code map
+
+| File/thư mục | Vai trò |
+| --- | --- |
+| `src/main.cpp` | Entry point và toàn bộ core pipeline hiện tại: options, queues, splitter, ASR simulator, TTS simulator, jitter/audio worker, ALSA/WAV/null sinks, metrics, barge-in. |
+| `CMakeLists.txt` | Build C++17 binary `edge_voice_pipeline`, link Threads và ALSA nếu `EDGEVOICE_WITH_ALSA=ON`. |
+| `config/benchmark_scenarios.json` | Mô tả scenario `mixed_vi_en`, `barge_in` và KPI mục tiêu. File này là tài liệu cấu hình, binary hiện không parse trực tiếp file này. |
+| `config/pi5_audio_alsa.env` | Giá trị env gợi ý cho Pi 5: ALSA device, period/buffer/jitter, split token, iterations, barge-in ms. |
+| `benchmark_results/benchmark.jsonl` | Kết quả benchmark simulated/null sink cho scenario mixed. |
+| `benchmark_results/benchmark_barge.jsonl` | Kết quả benchmark simulated/null sink cho scenario barge-in. |
+| `scripts/summarize_benchmark.py` | Script tổng hợp JSONL thành p50/p95/p99/worst TTFT, barge-in và underrun. |
+| `scripts/run_benchmark.sh` | Chạy benchmark mixed và barge-in trong container hoặc môi trường có binary. |
+| `scripts/docker_build.ps1`, `scripts/docker_run.ps1` | Build/run Docker ARM64 từ Windows PowerShell. |
+| `scripts/docker_build.sh`, `scripts/docker_run.sh` | Build/run Docker ARM64 từ Linux/macOS shell. |
+| `scripts/pi_setup.sh` | Cài dependency native trên Raspberry Pi OS và thêm user vào group audio nếu có. |
+| `scripts/pi_build_run.sh` | Build native trên Pi 5 bằng CMake/Ninja và chạy ALSA benchmark. |
+| `docker/Dockerfile.pi5` | Multi-stage Docker build Debian Bookworm ARM64, cài CMake/Ninja/libasound2-dev, build binary và runtime image. |
+| `docker/compose.yml` | Service `edge-voice-null` và `edge-voice-alsa`; ALSA service mount `/dev/snd`. |
+| `docs/ARCHITECTURE.md` | Tóm tắt kiến trúc worker, queue, jitter buffer, barge-in. |
+| `docs/BENCHMARK_PLAN.md` | Kế hoạch benchmark latency, buffer sweep, barge-in, soak test. |
+| `docs/DEPLOYMENT_PLAN.md` | Kế hoạch chạy Docker, Docker có ALSA, native Pi 5, tích hợp model thật. |
+| `docs/PI_NATIVE_PIPELINE.md` | Hướng dẫn build/chạy native, kiểm tra ALSA và công thức period/buffer. |
+| `assignment_ai_edge_3.docx` | File đề/bài kiểm tra đính kèm trong repo; không tham gia build/runtime. |
+
+Mapping theo khối yêu cầu:
+
+- Entry point: `main()` trong `src/main.cpp`.
+- Streaming pipeline/core logic: `run_once()`, `BlockingQueue<T>`, `RunState`.
+- ASR streaming adapter: chưa có adapter thật; hiện là `asr_simulator()`.
+- Token/sentence splitter: `SentenceSplitter`.
+- TTS streaming adapter: chưa có Valtec-TTS thật; hiện là `tts_worker()` + `generate_pcm_chunk()`.
+- Jitter buffer/audio output: `BlockingQueue<PcmChunk>` dùng như jitter buffer, `audio_worker()`, `AudioSink`.
+- Barge-in/cancel logic: `flush_audio_pipeline()`, `RunState::epoch`, `RunState::flush_requested`.
+- Benchmark: metric trong `Metrics`, JSONL output qua `append_line()`, summary script.
+- Tests: chưa có thư mục/file unit test trong repo.
+- Scripts build/run: thư mục `scripts/` và `docker/`.
+
+## 5. Đã test gì
+
+### Unit test
+
+Chưa có unit test trong repo. Chưa có test riêng cho `SentenceSplitter`, `BlockingQueue`, ALSA sink hoặc barge-in race condition.
+
+### Runtime smoke test
+
+Repo có kết quả runtime smoke/benchmark simulated trong:
+
+- `benchmark_results/benchmark.jsonl`
+- `benchmark_results/benchmark_barge.jsonl`
+
+Các file này chứng minh binary đã từng chạy với `--audio=null`, sinh JSONL metric và không báo lỗi trong các iteration được lưu.
+
+Lưu ý: các JSONL hiện có được tạo trước lần chỉnh source/README gần nhất. Chúng vẫn là bằng chứng benchmark simulated đã chạy, nhưng cần chạy lại để xác nhận chính xác binary hiện tại sau khi thêm metric `split_min_tokens`/`split_max_tokens`.
+
+### Benchmark đã đo gì
+
+Các JSONL hiện có đo:
+
+- `ttft_min_ms`, `ttft_avg_ms`, `ttft_max_ms`
+- `underruns`
+- `max_audio_gap_ms`
+- `barge_in_reaction_ms` với scenario barge-in
+- `segments`, `pcm_chunks`, `total_ms`
+
+Kết quả nổi bật hiện tại từ `python scripts/summarize_benchmark.py benchmark_results/*.jsonl`:
+
+| File | Loại | Count | TTFT p95 | TTFT worst | Barge worst | Underruns |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `benchmark_results/benchmark.jsonl` | simulated/null mixed | 10 | 197.316 ms | 198.859 ms | không áp dụng | 0 |
+| `benchmark_results/benchmark_barge.jsonl` | simulated/null barge-in | 5 | 99.516 ms | 100.688 ms | 27.661 ms | 0 |
+
+### Những phần chưa test xong
+
+- Chưa có benchmark trên Raspberry Pi 5 thật trong repo.
+- Chưa có benchmark ALSA thật với loa/mic.
+- Chưa có test nghe crackling thực tế.
+- Chưa có ASR partial latency thật.
+- Chưa có TTS first chunk latency thật từ Valtec-TTS.
+- Chưa có CPU/RAM/thermal soak test thật.
+- Chưa có metric dropped/duplicated text chunks trong JSONL hiện tại.
+- Chưa có CI hoặc unit test tự động.
+
+## 6. Benchmark
+
+### Cách chạy benchmark simulated/null
+
+Sau khi build Docker image:
+
+```powershell
+.\scripts\docker_build.ps1
+.\scripts\docker_run.ps1
+```
+
+Hoặc trên Linux:
+
+```bash
+./scripts/docker_build.sh
+./scripts/docker_run.sh
+```
+
+Nếu đã có binary:
+
+```bash
+./edge_voice_pipeline --audio=null --iterations=20 --out=benchmark_results/benchmark.jsonl
+./edge_voice_pipeline --audio=null --scenario=barge_in --barge-in-ms=450 --iterations=10 --out=benchmark_results/benchmark_barge.jsonl
+```
+
+Tổng hợp:
+
+```bash
+python3 scripts/summarize_benchmark.py benchmark_results/*.jsonl
+```
+
+### Cách chạy benchmark ALSA/Pi 5
+
+```bash
+chmod +x scripts/*.sh
+./scripts/pi_setup.sh
+ALSA_DEVICE=hw:0,0 PERIOD_MS=20 BUFFER_MS=120 JITTER_MS=60 ./scripts/pi_build_run.sh
+```
+
+Kết quả native dự kiến ghi vào:
 
 ```text
-generate_synthetic_pcm() hoặc WAV input
-  -> start_recording()
-  -> append_audio_chunk() theo từng frame PCM
-  -> stop_and_process()
-  -> SimulatedASRBackend.transcribe_pcm()
-  -> SimulatedTTSBackend.synthesize_to_pcm_bytes()
-  -> InferenceResult + RTF/RAM metrics
+benchmark_results/pi_native_alsa.jsonl
 ```
 
-Chi tiết mô phỏng:
+### Metric cần ghi nhận
 
-- Audio input là mono PCM `float32` trong RAM, mặc định 16 kHz.
-- ASR giả lập kiểm tra dtype/shape PCM, tính thời gian xử lý theo `quant`,
-  `num_threads` và độ dài audio.
-- Transcript giả lập deterministic dạng `xin chao robot ma <hash>`, giúp test
-  repeatable.
-- TTS giả lập tạo sóng PCM `int16` bytes trong RAM, không cần file trung gian.
-- `wer_delta_estimate` được gán theo quant: FP16 tốt nhất, Q4 nhanh nhất nhưng
-  WER delta cao hơn.
-- Buffer audio được clear sau mỗi lượt để tránh giữ RAM.
+| Metric | Ý nghĩa | Trạng thái trong repo |
+| --- | --- | --- |
+| TTFT | Từ lúc splitter commit segment đến lúc audio worker phát chunk đầu | Có: `ttft_*_ms` |
+| partial ASR latency | Từ audio frame/mic đến ASR partial | Chưa có, vì ASR đang simulated text |
+| splitter latency | Thời gian xử lý partial thành segment | Chưa đo riêng |
+| TTS first chunk latency | Từ text segment đến PCM chunk đầu | Mô phỏng bằng `tts_first_chunk_ms`, chưa đo TTS thật |
+| jitter buffer underrun count | Số lần audio worker timeout/xrun | Có: `underruns` |
+| audio write latency | Thời gian `snd_pcm_writei`/audio write | Chưa đo riêng |
+| CPU usage | Tải CPU khi chạy pipeline | Chưa ghi vào JSONL |
+| RAM slope | Tăng RAM theo thời gian soak test | Chưa ghi vào JSONL |
+| barge-in reaction time | Từ request ngắt đến lúc audio flush | Có: `barge_in_reaction_ms` |
+| dropped/duplicated text chunks | Số segment mất/trùng do ASR partial | Chưa ghi metric riêng; splitter có cơ chế chống duplicate |
 
-Vì vậy simulated benchmark chứng minh được kiến trúc, metrics và memory behavior
-của pipeline Python, nhưng không thay thế benchmark hiệu năng thật của
-`whisper.cpp`/Piper trên Raspberry Pi 5.
+Benchmark hiện có là simulated/emulated với `--audio=null`, không phải real hardware. Benchmark real hardware cần chạy trên Raspberry Pi 5 với `--audio=alsa` và nghe kiểm tra crackling.
 
-## Lựa chọn backend
+## 7. Cách chạy
 
-### ASR
+### Local/simulated
 
-Backend thật ưu tiên là `whisper.cpp` với Whisper Tiny vì:
+Repo không có binary prebuilt. Cần build bằng CMake hoặc Docker.
 
-- Native C/C++, phù hợp CPU ARM64 và không cần GPU.
-- Hỗ trợ các model GGML/GGUF đã lượng tử hóa như Q8/Q5/Q4.
-- Có thể tận dụng ARM NEON SIMD trên Cortex-A76 khi build native Release.
-- Python chỉ orchestration; inference không chạy bằng Python thuần tuần tự.
-
-Repo cũng có backend `simulated` để test nhanh và CI. Backend này deterministic,
-không thay thế benchmark thật trên Raspberry Pi 5.
-
-### TTS
-
-Backend thật ưu tiên là Piper TTS cho tiếng Việt vì:
-
-- Chạy offline 100%.
-- Model ONNX nhỏ, phù hợp CPU ARM.
-- Có CLI/package phổ biến, dễ đóng gói trong image ARM64.
-
-Lưu ý hiện tại: adapter `whisper.cpp` và `piper` đang gọi CLI qua `subprocess`.
-Python object được tạo một lần, nhưng CLI process có thể load model lại mỗi lượt.
-Để tối ưu latency cuối cùng, nên chuyển sang binding/session persistent nếu
-backend hỗ trợ.
-
-## Lượng tử hóa Whisper Tiny
-
-Model được chuẩn bị dưới các mức:
-
-- `FP16`: `models/whisper/ggml-tiny.bin`
-- `Q8`: `models/whisper/ggml-tiny-q8_0.bin`
-- `Q5`: `models/whisper/ggml-tiny-q5_0.bin`
-- `Q4`: `models/whisper/ggml-tiny-q4_0.bin`
-
-Kết quả model-prep mô phỏng hiện chọn `Q5`:
-
-```text
-selected: models/whisper/ggml-tiny-q5_0.bin
-mean_rtf: 0.19459
-wer_delta_estimate: 0.012
-```
-
-Lý do chọn `Q5`:
-
-- Nhanh hơn và nhẹ RAM/bandwidth hơn FP16/Q8.
-- Giữ độ chính xác tốt hơn Q4.
-- WER delta ước tính `0.012`, dưới ngưỡng suy giảm 2%.
-
-`Q4` nhanh hơn trong mô phỏng nhưng bị loại vì WER delta ước tính `0.026`, vượt
-ngưỡng `0.02`.
-
-## Tối ưu hiệu năng trên Raspberry Pi 5
-
-Build `whisper.cpp` native ARM64:
+Nếu có CMake/Ninja và không cần ALSA:
 
 ```bash
-git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git
-cmake -S whisper.cpp -B whisper.cpp/build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_NATIVE=ON
-cmake --build whisper.cpp/build -j4 --config Release
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DEDGEVOICE_WITH_ALSA=OFF
+cmake --build build --target edge_voice_pipeline
+./build/edge_voice_pipeline --audio=null --iterations=5
 ```
 
-Khuyến nghị benchmark `num_threads = 1, 2, 3, 4`. Raspberry Pi 5 có 4 nhân vật
-lý, nhưng `4` threads không luôn nhanh nhất vì cache contention, scheduling
-overhead, memory bandwidth và thermal throttling. Điểm bắt đầu hợp lý là `2`
-threads, sau đó chọn cấu hình có `mean_rtf` và `p95_rtf` tốt nhất trên board
-thật.
-
-## Code map
-
-```text
-src/edge_voice_test/pipeline.py
-  VoicePipeline, warm_up(), PTT buffer, ASR/TTS orchestration, RTF/RAM metrics
-
-src/edge_voice_test/runtime.py
-  CLI smoke test, hỗ trợ simulated hoặc real backend, có warm-up mặc định
-
-src/edge_voice_test/backends/base.py
-  BackendConfig, ASR/TTS protocol, backend factory
-
-src/edge_voice_test/backends/simulated.py
-  Backend giả lập deterministic cho test nhanh, có RTF/WER giả lập theo quant
-
-src/edge_voice_test/backends/whisper_cpp.py
-  Adapter gọi whisper.cpp CLI, ưu tiên temp WAV trong /dev/shm
-
-src/edge_voice_test/backends/piper.py
-  Adapter gọi Piper CLI, ưu tiên output temp file trong /dev/shm
-
-benchmarks/benchmark_pipeline.py
-  Benchmark nhiều vòng, ghi CSV, summary JSON, warm-up, RTF/RAM/load-once checks
-
-test_matrix.py
-  Chạy ma trận FP16/Q8/Q5/Q4 x threads 1/2/3/4
-
-scripts/
-  Download model, build ARM64 image, build whisper.cpp, quantize model
-```
-
-## Chạy runtime smoke
-
-Simulated backend:
-
-```powershell
-$env:PYTHONPATH="src"
-python -m edge_voice_test.runtime `
-  --asr-backend simulated `
-  --tts-backend simulated `
-  --duration 2 `
-  --loops 2
-```
-
-Real backend trên Raspberry Pi 5:
+Nếu build có ALSA trên Linux:
 
 ```bash
-export PYTHONPATH=src
-python -m edge_voice_test.runtime \
-  --asr-backend whisper-cpp \
-  --tts-backend piper \
-  --threads 2 \
-  --quant Q5 \
-  --whisper-model models/whisper/ggml-tiny.bin \
-  --piper-model models/piper/vi_VN-vais1000-medium/vi_VN-vais1000-medium.onnx \
-  --piper-config models/piper/vi_VN-vais1000-medium/vi_VN-vais1000-medium.onnx.json
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DEDGEVOICE_WITH_ALSA=ON
+cmake --build build --target edge_voice_pipeline
+./build/edge_voice_pipeline --audio=alsa --alsa-device=default --iterations=20
 ```
 
-Runtime mặc định chạy `warm_up()` trước vòng đo chính. Có thể tắt bằng
-`--skip-warm-up` nếu muốn đo cold-start.
+### Docker
 
-## Đã test gì
-
-Unit tests hiện có trong `tests/test_correctness.py` kiểm tra:
-
-- Model ASR/TTS simulated chỉ được load một lần khi tạo `VoicePipeline`.
-- Với Q5 và 2 threads, simulated pipeline đạt RTF nhỏ hơn `0.3`.
-- Push-to-Talk API hoạt động đúng: `start_recording()`, `append_audio_chunk()`,
-  `stop_and_process()`.
-- Pipeline nhận raw PCM trong RAM và trả transcript + TTS bytes.
-- Không tạo `*.wav` hoặc `temp*.wav` trong thư mục làm việc khi dùng simulated
-  backend.
-- `warm_up()` chạy được mà không làm tăng load count của model.
-- PCM sai shape, ví dụ stereo/2D array, bị reject.
-
-Runtime smoke hiện kiểm tra:
-
-- CLI `edge_voice_test.runtime` tạo pipeline, warm-up, chạy một hoặc nhiều vòng
-  PTT giả lập và in JSON result.
-- Output có `runtime_ok`, `rtf`, `ram_before_mb`, `ram_after_mb`,
-  `asr_load_count`, `tts_load_count` và thông tin warm-up.
-
-Benchmark hiện kiểm tra:
-
-- Chạy nhiều loop qua cùng pipeline để đo steady-state.
-- Ghi CSV từng loop vào `results/*.csv`.
-- In summary JSON gồm mean/p95 RTF, wall RTF, ASR/TTS time, RAM slope,
-  load-once pass và memory-leak pass.
-- `test_matrix.py` chạy ma trận `FP16/Q8/Q5/Q4 x threads 1/2/3/4`.
-
-Kết quả đã lưu:
-
-- `results/matrix_summary.csv`: simulated quant/thread matrix.
-- `results/model_prep/model_prep_report.json`: báo cáo chọn model quantized.
-- `results/model_prep/model_prep_summary.csv`: tóm tắt FP16/Q8/Q5/Q4.
-
-Kết quả nổi bật hiện tại:
-
-```text
-Q5, threads=2, audio=5s
-mean_rtf_sim = 0.19459
-wer_delta_estimate = 0.012
-load_once_pass = true
-memory_leak_pass_simple = true
-```
-
-Chưa test xong trong repo:
-
-- GPIO button thật.
-- Microphone thật.
-- Speaker playback thật.
-- End-to-end latency trên Raspberry Pi 5 vật lý.
-- RTF thật của `whisper.cpp` + Piper trên Pi 5.
-
-## Benchmark
-
-Benchmark một cấu hình:
+Windows PowerShell:
 
 ```powershell
-$env:PYTHONPATH="src"
-python benchmarks/benchmark_pipeline.py `
-  --asr-backend simulated `
-  --tts-backend simulated `
-  --quant Q5 `
-  --threads 2 `
-  --duration 5 `
-  --loops 50 `
-  --out results/benchmark_q5_t2.csv
+.\scripts\docker_build.ps1
+.\scripts\docker_run.ps1
 ```
 
-Output summary gồm:
-
-- `mean_asr_time_sec`
-- `mean_tts_time_sec`
-- `mean_total_time_sec`
-- `mean_rtf`, `p95_rtf`
-- `mean_wall_rtf`, `p95_wall_rtf`
-- `ram_slope_mb_per_loop`
-- `load_once_pass`
-- `memory_leak_pass_simple`
-- `rtf_pass`
-
-Chạy ma trận quant/thread:
-
-```powershell
-$env:PYTHONPATH="src"
-python test_matrix.py
-```
-
-Kết quả hiện có trong `results/matrix_summary.csv` cho thấy simulated Q5 với
-2 threads đạt `mean_rtf_sim = 0.19459`, load-once pass và RAM slope gần 0.
-
-## Docker ARM64
-
-Build image ARM64:
-
-```powershell
-docker buildx build --platform linux/arm64 `
-  -t edge-voice-ptt-test:arm64 `
-  -f Dockerfile.arm64 `
-  --load .
-```
-
-Build image có real backend binaries:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_arm64_image.ps1 -RealBackends
-```
-
-Runtime smoke ARM64:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_arm64_runtime.ps1 -Memory 4g
-```
-
-Benchmark ARM64 emulation:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_arm64_emulation.ps1 -Memory 4g
-powershell -ExecutionPolicy Bypass -File .\scripts\run_arm64_emulation.ps1 -Memory 8g
-```
-
-QEMU/ARM64 emulation chỉ chứng minh packaging và compatibility, không được dùng
-để khẳng định RTF thật trên Raspberry Pi 5.
-
-## Model preparation
-
-Download base models:
+Linux/macOS shell:
 
 ```bash
-scripts/download_models.sh
+./scripts/docker_build.sh
+./scripts/docker_run.sh
 ```
 
-Build whisper.cpp:
+Docker Compose với null sink:
 
 ```bash
-scripts/build_whisper_cpp.sh
+docker compose -f docker/compose.yml run --rm edge-voice-null
 ```
 
-Quantize Whisper Tiny:
+Docker Compose với ALSA trên Linux host có `/dev/snd`:
 
 ```bash
-scripts/quantize_whisper_tiny.sh
+docker compose -f docker/compose.yml run --rm edge-voice-alsa
 ```
 
-Run model-prep report:
+### Raspberry Pi 5 native
 
-```powershell
-docker run --rm --platform linux/arm64 `
-  -e PYTHONPATH=/app/src `
-  -v "${PWD}\models:/app/models" `
-  -v "${PWD}\results:/app/results" `
-  edge-voice-ptt-test:arm64 `
-  python scripts/prepare_whisper_models.py `
-    --skip-quantize `
-    --threads 2 `
-    --duration 5 `
-    --loops 10 `
-    --results-dir results/model_prep
+```bash
+chmod +x scripts/*.sh
+./scripts/pi_setup.sh
+./scripts/pi_build_run.sh
 ```
 
-## Trạng thái hiện tại
+Tùy chỉnh:
 
-Đã có:
+```bash
+ALSA_DEVICE=hw:0,0 \
+PERIOD_MS=20 \
+BUFFER_MS=120 \
+JITTER_MS=60 \
+SPLIT_MIN_TOKENS=4 \
+SPLIT_MAX_TOKENS=16 \
+ITERATIONS=50 \
+./scripts/pi_build_run.sh
+```
 
-- Core `VoicePipeline`.
-- Warm-up ASR/TTS trước benchmark.
-- Simulated ASR/TTS backend.
-- Real backend adapters cho `whisper.cpp` và Piper CLI.
-- RTF/RAM/load-once metrics.
-- Benchmark CSV/JSON summary.
-- Quantization/model-prep report.
-- Docker ARM64 path.
+### Real backend/hardware
 
-Chưa có:
+Chưa có trong repo. Để chạy real backend cần:
 
-- GPIO button service.
-- Microphone recorder service.
-- Speaker playback service.
-- Full end-to-end PTT app trên Raspberry Pi 5.
-- Benchmark vật lý trên Raspberry Pi 5 với mic/loa thật.
-- Persistent native ASR/TTS session thay cho CLI subprocess mỗi lượt.
+- Thay `asr_simulator()` bằng adapter Zipformer Multilingual hoặc Whisper-Tiny streaming wrapper.
+- Thay `generate_pcm_chunk()` bằng Valtec-TTS streaming chunk generator.
+- Giữ output PCM S16_LE cùng sample rate/channels với ALSA config.
+- Giữ `text_queue`, `jitter_buffer`, `audio_worker()` và `flush_audio_pipeline()` để benchmark trước/sau công bằng.
 
-Kết luận trung thực: repo đã đủ để kiểm chứng lõi inference/benchmark và chuẩn
-bị deployment ARM64. Để thành thiết bị PTT hoàn chỉnh cần thêm lớp hardware I/O
-và benchmark trực tiếp trên Raspberry Pi 5.
+### Test
+
+Chưa có unit test. Smoke/benchmark hiện chạy bằng binary và JSONL:
+
+```bash
+./edge_voice_pipeline --audio=null --iterations=5 --out=benchmark_results/benchmark.jsonl
+./edge_voice_pipeline --audio=null --scenario=barge_in --barge-in-ms=450 --iterations=5 --out=benchmark_results/benchmark_barge.jsonl
+python3 scripts/summarize_benchmark.py benchmark_results/*.jsonl
+```
+
+## 8. Trạng thái hiện tại
+
+### Đã có
+
+- C++17 prototype pipeline một file trong `src/main.cpp`.
+- Thread-safe `BlockingQueue<T>`.
+- `SentenceSplitter` có `split_min_tokens`, `split_max_tokens`, hard boundary, soft boundary và chống duplicate segment.
+- ASR partial simulator cho scenario mixed Vietnamese-English.
+- TTS simulator sinh PCM sine chunk.
+- Jitter/prebuffer trong `audio_worker()`.
+- Audio sink `null`, `wav`, `alsa`.
+- ALSA path có `snd_pcm_writei`, recover xrun, `snd_pcm_drop`/`prepare` khi flush.
+- Barge-in simulated bằng epoch/cancel và clear queue.
+- JSONL metrics cho TTFT, underrun, max audio gap, barge-in reaction.
+- Docker ARM64 build/runtime.
+- Script native Pi 5 build/run.
+- Benchmark simulated/null đã có trong `benchmark_results/`.
+
+### Chưa có
+
+- Chưa có ASR model thật.
+- Chưa có Valtec-TTS thật.
+- Chưa có microphone capture/VAD thật.
+- Chưa có echo cancellation/ducking để nghe barge-in khi robot đang nói.
+- Chưa có spatial audio pipeline thật.
+- Chưa có PipeWire implementation trong code.
+- Chưa có unit test tự động.
+- Chưa có CI.
+- Chưa có benchmark Raspberry Pi 5/ALSA thật trong repo.
+- Chưa có đo CPU/RAM/thermal trong JSONL.
+- Chưa có metric partial ASR latency, splitter latency riêng, audio write latency riêng, dropped/duplicated chunks.
+
+### Cần làm tiếp để thành bản hoàn chỉnh
+
+1. Tách `src/main.cpp` thành module rõ hơn: ASR adapter, splitter, TTS adapter, jitter buffer, audio sink, metrics.
+2. Thêm unit test cho `SentenceSplitter`, `BlockingQueue`, duplicate partial và partial correction.
+3. Tích hợp Zipformer Multilingual streaming hoặc Whisper-Tiny sliding window.
+4. Tích hợp Valtec-TTS streaming, đo first PCM chunk latency thật.
+5. Thêm microphone/VAD/echo suppression cho barge-in thật.
+6. Chạy benchmark native trên Raspberry Pi 5 với `--audio=alsa`.
+7. Sweep period/buffer/jitter trên Pi 5 và ghi `pi_native_alsa.jsonl`.
+8. Bổ sung CPU/RAM/thermal monitoring và soak test 500+ iterations.
+9. Thêm metric dropped/duplicated text chunks và ASR repetition rate.
+10. Nếu cần spatial audio routing, thêm PipeWire backend hoặc bridge sang hệ spatial audio đang dùng.

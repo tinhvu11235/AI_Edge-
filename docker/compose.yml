@@ -1,0 +1,31 @@
+services:
+  edge-voice-null:
+    image: ai-edge-pi5-voice:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pi5
+    platform: linux/arm64/v8
+    volumes:
+      - ../benchmark_results:/app/results
+    command:
+      - --audio=null
+      - --iterations=5
+      - --out=/app/results/benchmark.jsonl
+
+  edge-voice-alsa:
+    image: ai-edge-pi5-voice:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pi5
+    platform: linux/arm64/v8
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
+    volumes:
+      - ../benchmark_results:/app/results
+    command:
+      - --audio=alsa
+      - --alsa-device=default
+      - --iterations=10
+      - --out=/app/results/benchmark_alsa.jsonl
