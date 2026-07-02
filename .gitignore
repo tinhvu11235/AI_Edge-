@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Large downloaded/generated artifacts.
+models/
+third_party/
+

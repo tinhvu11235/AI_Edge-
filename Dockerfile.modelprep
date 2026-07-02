@@ -1,0 +1,12 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates git cmake build-essential python3 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git /opt/whisper.cpp && \
+    cmake -S /opt/whisper.cpp -B /opt/whisper.cpp/build -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /opt/whisper.cpp/build -j 4 --config Release
+
+WORKDIR /work
+ENTRYPOINT ["/opt/whisper.cpp/build/bin/whisper-quantize"]

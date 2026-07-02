@@ -1,0 +1,9 @@
+.git
+.agents
+.codex
+.venv
+__pycache__
+*.pyc
+models
+results
+third_party
